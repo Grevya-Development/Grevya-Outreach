@@ -4,6 +4,8 @@ import { lookup as dnsLookup } from "node:dns";
 import { Agent, fetch as undiciFetch } from "undici";
 import { isIP } from "node:net";
 import { chat, parseJson } from "./groq";
+import { industryText, type IndustryBrief } from "./industry";
+import { PILLARS, playbookText, type Pillar, type Playbook } from "./playbook";
 import { db } from "./supabase";
 
 export const FREE_MAIL = new Set([
@@ -26,6 +28,16 @@ const MAX_BYTES = 1_500_000;
 const MAX_TEXT = 6000;
 const STALE_DAYS = 30;
 
+export interface UseCase {
+  title: string;              // "Automated PO-to-invoice matching"
+  pillar: Pillar;             // which of our solution areas delivers it
+  problem: string;            // their pain, concrete, in their language
+  solution: string;           // what we would build / change
+  outcome: string;            // the measurable result (no invented numbers about them)
+  first_step: string;         // a small, low-risk way to start (pilot, audit, workshop)
+  grounded_in: "fact" | "industry";
+}
+
 export interface Analysis {
   company_name: string;
   what_they_do: string;
@@ -39,6 +51,8 @@ export interface Analysis {
   fit_reason: string;
   angle: string;            // one-sentence hook for the email
   confidence: "low" | "medium" | "high";
+  industry_context: string; // 1-2 sentences on this industry's operating reality (general knowledge)
+  use_cases: UseCase[];     // 3 concrete use cases, best first, each on a different pillar when possible
 }
 
 export interface Research {
@@ -286,28 +300,48 @@ export function profileText(p: CompanyProfile): string {
   ].filter(Boolean).join("\n");
 }
 
-const ANALYZE_SYSTEM = `You are a B2B sales researcher. From a prospect's website text, produce a factual brief for a cold email.
+const ANALYZE_SYSTEM = `You are a senior solutions consultant at a Gen AI / automation services company, researching one prospect before a cold email.
+From the prospect's website text (plus an industry brief when given), produce a brief that lets a writer craft a SPECIFIC use case for them.
 Return JSON with exactly these keys:
-{"company_name": string, "what_they_do": string (1 sentence), "industry": string, "business_model": string,
- "customers": string, "facts": string[] (2-5 concrete facts stated on the site: products, markets, clients, numbers, launches),
- "likely_needs": string[] (2-3 inferred needs where OUR services could help; phrase as inferences),
- "best_service": string (which of OUR services fits best, using our wording), "fit_score": integer 0-10,
- "fit_reason": string, "angle": string (one specific, non-generic hook connecting a fact about them to our best service — never claim we have worked with similar companies unless our proof says so),
+{"company_name": string, "what_they_do": string (1 sentence), "industry": string (specific, e.g. "two-wheeler manufacturing" not "automotive"), "business_model": string,
+ "customers": string, "facts": string[] (2-6 concrete facts stated on the site: products, plants, markets, scale, clients, launches, hiring, tools they use),
+ "industry_context": string (1-2 sentences on how companies like this operate and where work is still manual — general knowledge, say so),
+ "likely_needs": string[] (2-4 inferred operational needs, phrased as inferences),
+ "use_cases": [ {"title": string (5-8 words), "pillar": one of ALLOWED PILLARS, "problem": string (the pain in their words — name the workflow, the people, the friction), "solution": string (what we'd build or change — concrete: inputs, what the system does, who approves), "outcome": string (what improves; qualitative or a range from the INDUSTRY brief, never a number invented about THIS company), "first_step": string (a 2-4 week pilot, audit or workshop), "grounded_in": "fact" | "industry"} ] (exactly 3, best first, use different pillars where sensible, at least one grounded in a FACT from their site),
+ "best_service": string (which of OUR services fits best, our wording), "fit_score": integer 0-10, "fit_reason": string,
+ "angle": string (one specific hook connecting a fact about them to use case 1),
  "confidence": "low" | "medium" | "high"}
-Rules: facts must come from the website text only — never invent. If the text is thin, say so, keep facts empty and confidence low.
-fit_score: 8-10 clear need + right size/industry for us; 4-7 plausible; 0-3 poor fit (e.g. competitor, tiny, unrelated).`;
+Rules: facts come from the website text only — never invent. Industry statements are general knowledge and must be labelled by grounded_in. Use cases must be things OUR services (and the playbook's solution areas) can actually deliver. If the text is thin, say so: keep facts empty, confidence low, and ground use cases in the industry brief.
+fit_score: 8-10 clear need + right size/industry for us; 4-7 plausible; 0-3 poor fit (competitor, tiny, unrelated).`;
 
-export async function analyze(r: Pick<Research, "domain" | "title" | "description" | "content" | "tech">, profile: CompanyProfile, model?: string): Promise<Analysis> {
+export async function analyze(
+  r: Pick<Research, "domain" | "title" | "description" | "content" | "tech">,
+  profile: CompanyProfile,
+  model?: string,
+  ctx: { playbook?: Playbook; industryBrief?: IndustryBrief | null } = {},
+): Promise<Analysis> {
+  const pillars = ctx.playbook?.pillars ?? PILLARS;
   const user = [
     `OUR COMPANY (the sender):\n${profileText(profile) || "(not provided)"}`,
+    ctx.playbook ? `PLAYBOOK:\n${playbookText(ctx.playbook)}` : `ALLOWED PILLARS: ${pillars.join(", ")}`,
+    `ALLOWED PILLARS (use exactly these strings): ${pillars.join(", ")}`,
+    ctx.industryBrief ? industryText(ctx.industryBrief, pillars) : "",
     `PROSPECT DOMAIN: ${r.domain}`,
     r.title && `Page title: ${r.title}`,
     r.description && `Meta description: ${r.description}`,
     r.tech.length ? `Detected on their site: ${r.tech.join(", ")}` : "",
     `Website text:\n${r.content.slice(0, 4500) || "(empty)"}`,
   ].filter(Boolean).join("\n\n");
-  const raw = await chat({ system: ANALYZE_SYSTEM, user, temperature: 0.2, maxTokens: 700, json: true, model, pool: "research" });
+  const raw = await chat({ system: ANALYZE_SYSTEM, user, temperature: 0.25, maxTokens: 1300, json: true, model, pool: "research" });
   const a = parseJson<Partial<Analysis>>(raw);
+  const useCases: UseCase[] = (Array.isArray(a.use_cases) ? a.use_cases : []).slice(0, 3).map((u) => {
+    const x = (u ?? {}) as Partial<UseCase>;
+    const pillar = (PILLARS.find((p) => p.toLowerCase() === String(x.pillar ?? "").toLowerCase()) ?? pillars[0]) as Pillar;
+    return {
+      title: String(x.title ?? "").slice(0, 80), pillar, problem: String(x.problem ?? ""), solution: String(x.solution ?? ""),
+      outcome: String(x.outcome ?? ""), first_step: String(x.first_step ?? ""), grounded_in: (x.grounded_in === "fact" ? "fact" : "industry") as "fact" | "industry",
+    };
+  }).filter((u) => u.title && u.problem && u.solution);
   return {
     company_name: String(a.company_name ?? ""),
     what_they_do: String(a.what_they_do ?? ""),
@@ -321,6 +355,8 @@ export async function analyze(r: Pick<Research, "domain" | "title" | "descriptio
     fit_reason: String(a.fit_reason ?? ""),
     angle: String(a.angle ?? ""),
     confidence: a.confidence === "high" || a.confidence === "medium" ? a.confidence : "low",
+    industry_context: String(a.industry_context ?? ""),
+    use_cases: useCases,
   };
 }
 
@@ -328,12 +364,13 @@ export async function analyze(r: Pick<Research, "domain" | "title" | "descriptio
  * Returns research for a domain, using the cache when fresh. Crawl failures are cached too
  * (shorter) so a dead site isn't re-fetched for every lead at that company.
  */
-export async function researchDomain(domain: string, profile: CompanyProfile, opts: { force?: boolean; model?: string } = {}): Promise<Research> {
+export async function researchDomain(domain: string, profile: CompanyProfile, opts: { force?: boolean; model?: string; playbook?: Playbook; industryBrief?: IndustryBrief | null } = {}): Promise<Research> {
   const supa = db();
   const { data: cached } = await supa.from("company_research").select("*").eq("domain", domain).maybeSingle();
   const age = cached ? Date.now() - new Date(cached.fetched_at).getTime() : Infinity;
   const fresh = cached && (cached.status === "ok" ? age < STALE_DAYS * 86_400_000 : age < 3 * 86_400_000);
-  if (fresh && !opts.force && (cached.status === "failed" || cached.analysis)) return cached as Research;
+  const upToDate = cached?.analysis && Array.isArray((cached.analysis as Analysis).use_cases) && (cached.analysis as Analysis).use_cases.length > 0;
+  if (fresh && !opts.force && (cached.status === "failed" || upToDate)) return cached as Research;
 
   let base: Omit<Research, "analysis" | "analyzed_at">;
   if (fresh && !opts.force && cached.status === "ok") {
@@ -350,7 +387,7 @@ export async function researchDomain(domain: string, profile: CompanyProfile, op
       return failed;
     }
   }
-  const analysis = await analyze(base, profile, opts.model);
+  const analysis = await analyze(base, profile, opts.model, { playbook: opts.playbook, industryBrief: opts.industryBrief });
   const row: Research = { ...base, analysis, analyzed_at: new Date().toISOString() };
   await supa.from("company_research").upsert(row);
   return row;

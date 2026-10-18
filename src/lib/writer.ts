@@ -1,6 +1,8 @@
 // Writes a lead's whole sequence (first email + follow-ups) from company research, our
 // profile and each step's instructions. Output is checked and regenerated once if it fails.
 import { chat, parseJson } from "./groq";
+import { industryText, type IndustryBrief } from "./industry";
+import { DEFAULT_PLAYBOOK, lengthBounds, playbookText, type Playbook } from "./playbook";
 import { profileText, type Analysis, type CompanyProfile } from "./research";
 import { checkContent } from "./spamcheck";
 
@@ -18,6 +20,10 @@ export interface WriteInput {
   steps: { brief: string; delay_days: number }[];
   extraInstructions: string;
   model?: string;
+  playbook?: Playbook;
+  industryBrief?: IndustryBrief | null;
+  /** A note from the user for this one lead ("mention their new plant in Hosur"). */
+  leadInstruction?: string;
 }
 
 const SYSTEM = `You write hyper-personalised B2B cold email sequences that get replies and land in the inbox.
@@ -25,7 +31,8 @@ Return JSON: {"emails": [{"subject": string, "body": string}, ...]} — exactly 
 
 Hard rules (breaking any = rejected):
 - Plain text. No links, no URLs, no images, no markdown, no bullet symbols, no emojis, no placeholders like [Name].
-- Email 1: 60–110 words. Follow-ups: 25–70 words. Short paragraphs separated by a blank line.
+- Email 1: {{LENGTH}} words. Follow-ups: 25–70 words. Short paragraphs separated by a blank line.
+- Email 1 follows the PLAYBOOK structure and is built around USE CASE 1: name their problem concretely (the workflow, who does it, the friction), say what we'd build and which solution area it is (Gen AI / Agentic AI / Technology / Digital Transformation, in plain words), give the outcome, then the ask. Follow-ups each use the NEXT use case unless the playbook says otherwise.
 - Email 1 subject: 2–6 words, lowercase except names, specific to them, no "Re:", no "!" — looks like a colleague wrote it.
 - Follow-up subjects must be "" (they are sent as replies in the same thread).
 - Start with "Hi {first name}," on its own line (or "Hi there," if no name). Do not use their name again.
@@ -56,7 +63,15 @@ function brief(input: WriteInput): string {
       ? `RESEARCH:\nWhat they do: ${a.what_they_do}\nIndustry: ${a.industry}\nBusiness model: ${a.business_model}\nCustomers: ${a.customers}\nFACTS (true, from their site): ${a.facts.join(" | ") || "none"}\nLikely needs (inference): ${a.likely_needs.join(" | ")}\nBest service for them: ${a.best_service}\nSuggested angle: ${a.angle}`
       : "RESEARCH: none available — keep the opener about their role/industry and make no claims about the company.",
     input.tech.length ? `Detected on their website: ${input.tech.join(", ")}` : "",
+    `PLAYBOOK:\n${playbookText(input.playbook ?? DEFAULT_PLAYBOOK)}`,
+    industryText(input.industryBrief ?? null, (input.playbook ?? DEFAULT_PLAYBOOK).pillars),
+    a?.industry_context && `Industry context: ${a.industry_context}`,
+    a?.use_cases?.length
+      ? `USE CASES (write Email 1 around #1; ${(input.playbook ?? DEFAULT_PLAYBOOK).follow_up_strategy === "same_use_case" ? "follow-ups nudge #1 from new angles" : "follow-up 2 uses #2, follow-up 3 uses #3, later ones close out"}):\n` +
+        a.use_cases.map((u, i) => `#${i + 1} ${u.title} [${u.pillar}; grounded in ${u.grounded_in}]\n   Problem: ${u.problem}\n   What we'd build: ${u.solution}\n   Outcome: ${u.outcome}\n   First step: ${u.first_step}`).join("\n")
+      : "",
     input.extraInstructions && `Campaign instructions: ${input.extraInstructions}`,
+    input.leadInstruction && `INSTRUCTION FOR THIS LEAD (must follow): ${input.leadInstruction}`,
     `STEPS (${input.steps.length}):\n${input.steps.map((s, i) => `${i + 1}. ${i === 0 ? "First email" : `Follow-up after ${s.delay_days} days`}: ${s.brief || (i === 0 ? "Personalised intro." : i === input.steps.length - 1 ? "Short, friendly close-out." : "Add a new angle.")}`).join("\n")}`,
   ];
   return lines.filter(Boolean).join("\n\n");
@@ -91,13 +106,13 @@ export function unprovenClaims(body: string, proof: string): string[] {
   });
 }
 
-function validate(emails: WrittenEmail[], stepCount: number, sources = "", proof = ""): string[] {
+function validate(emails: WrittenEmail[], stepCount: number, sources = "", proof = "", bounds: [number, number] = [35, 150]): string[] {
   const problems: string[] = [];
   const src = sources.toLowerCase();
   if (emails.length !== stepCount) problems.push(`expected ${stepCount} emails, got ${emails.length}`);
   emails.forEach((e, i) => {
     const words = e.body.split(/\s+/).filter(Boolean).length;
-    if (i === 0 && (words < 35 || words > 150)) problems.push(`email 1 has ${words} words`);
+    if (i === 0 && (words < bounds[0] - 10 || words > bounds[1] + 25)) problems.push(`email 1 has ${words} words (wanted ${bounds[0]}–${bounds[1]})`);
     if (i > 0 && words > 100) problems.push(`email ${i + 1} has ${words} words`);
     const r = checkContent(e.subject, e.body, { allowLinks: 0, isFollowUp: i > 0 });
     for (const issue of r.issues) {
@@ -122,8 +137,12 @@ export async function writeSequence(input: WriteInput): Promise<WrittenEmail[]> 
   // Everything the model is allowed to quote numbers from.
   const a = input.analysis;
   const p = input.profile;
+  const pb = input.playbook ?? DEFAULT_PLAYBOOK;
+  const bounds = lengthBounds(pb.length);
   const sources = [
-    p.proof, p.services, p.one_liner, p.cta, p.ideal_customer, p.sender_title, p.name, input.extraInstructions,
+    p.proof, p.services, p.one_liner, p.cta, p.ideal_customer, p.sender_title, p.name, input.extraInstructions, input.leadInstruction,
+    playbookText(pb), industryText(input.industryBrief ?? null, pb.pillars), a?.industry_context,
+    a?.use_cases?.map((u) => `${u.title} ${u.problem} ${u.solution} ${u.outcome} ${u.first_step}`).join(" "),
     a ? [...a.facts, ...a.likely_needs, a.what_they_do, a.customers, a.company_name, a.industry, a.business_model, a.best_service, a.angle].join(" ") : "",
     input.tech.join(" "),
     input.lead.title, input.lead.company, input.lead.notes, Object.values(input.lead.custom ?? {}).join(" "),
@@ -131,7 +150,7 @@ export async function writeSequence(input: WriteInput): Promise<WrittenEmail[]> 
   ].filter(Boolean).join(" ");
   for (let attempt = 0; attempt < 3; attempt++) {
     const raw = await chat({
-      system: SYSTEM,
+      system: SYSTEM.replace("{{LENGTH}}", bounds.join("–")),
       user: brief(input) + (feedback ? `\n\nYOUR PREVIOUS DRAFT WAS REJECTED: ${feedback}. Fix these problems.` : ""),
       temperature: 0.6,
       maxTokens: 300 + input.steps.length * 220,
@@ -144,7 +163,7 @@ export async function writeSequence(input: WriteInput): Promise<WrittenEmail[]> 
       subject: i === 0 ? tidy(String(e.subject ?? "")).trim() : "",
       body: tidy(String(e.body ?? "")).replace(/\r/g, "").replace(/\n{3,}/g, "\n\n").trim(),
     }));
-    const problems = validate(emails, input.steps.length, sources, `${p.proof} ${p.one_liner} ${p.services}`);
+    const problems = validate(emails, input.steps.length, sources, `${p.proof} ${p.one_liner} ${p.services}`, bounds);
     if (!problems.length) return emails;
     feedback = problems.join("; ");
   }

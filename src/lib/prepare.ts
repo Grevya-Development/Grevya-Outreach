@@ -3,6 +3,8 @@
 // and is paced to Groq's limits, so sending never waits on the AI.
 import { env } from "./env";
 import { RateLimitError } from "./groq";
+import { industryBrief } from "./industry";
+import { getPlaybook } from "./playbook";
 import { getProfile } from "./profile";
 import { missingMigrations } from "./schema";
 import { leadDomain, researchDomain, type Research } from "./research";
@@ -26,6 +28,9 @@ export interface Personalization {
   fit_score?: number;
   generated_at: string;
   ai_line?: string;
+  use_case?: string;
+  pillar?: string;
+  industry?: string;
 }
 
 /**
@@ -33,7 +38,7 @@ export interface Personalization {
  * Results are only saved if the claim is still current — if the sequence was edited or the
  * lead was sent back for rewriting meanwhile, the stale draft is discarded.
  */
-export async function prepareLead(cl: CampaignLead, opts: { force?: boolean } = {}): Promise<"ready" | "review" | "skipped" | "superseded"> {
+export async function prepareLead(cl: CampaignLead, opts: { force?: boolean; instruction?: string } = {}): Promise<"ready" | "review" | "skipped" | "superseded"> {
   const supa = db();
   const [campaign, steps, lead, profile] = await Promise.all([
     supa.from("campaigns").select("*").eq("id", cl.campaign_id).single().then(must) as Promise<Campaign>,
@@ -56,8 +61,11 @@ export async function prepareLead(cl: CampaignLead, opts: { force?: boolean } = 
 
   const domain = leadDomain(lead);
   let research: Research | null = null;
-  if (domain) research = await researchDomain(domain, profile, { force: opts.force });
+  const playbook = await getPlaybook(cl.campaign_id);
+  if (domain) research = await researchDomain(domain, profile, { force: opts.force, playbook });
   const analysis = research?.status === "ok" ? research.analysis : null;
+  // Industry research (cached per industry) grounds the use cases and the writing.
+  const brief = analysis?.industry ? await industryBrief(analysis.industry) : null;
 
   // Skip clear non-fits before spending a send on them.
   if (campaign.min_fit_score > 0 && analysis && analysis.confidence !== "low" && analysis.fit_score < campaign.min_fit_score) {
@@ -76,6 +84,9 @@ export async function prepareLead(cl: CampaignLead, opts: { force?: boolean } = 
     senderName: "",
     steps: steps.map((s) => ({ brief: s.body, delay_days: s.delay_days })),
     extraInstructions: [campaign.ai_prompt, campaign.sender_context && `Context: ${campaign.sender_context}`].filter(Boolean).join("\n"),
+    playbook,
+    industryBrief: brief,
+    leadInstruction: opts.instruction,
   });
 
   const personalization: Personalization = {
@@ -83,6 +94,9 @@ export async function prepareLead(cl: CampaignLead, opts: { force?: boolean } = 
     research_domain: domain,
     angle: analysis?.angle,
     best_service: analysis?.best_service,
+    use_case: analysis?.use_cases?.[0]?.title,
+    pillar: analysis?.use_cases?.[0]?.pillar,
+    industry: analysis?.industry,
     fit_score: analysis?.fit_score,
     generated_at: new Date().toISOString(),
   };

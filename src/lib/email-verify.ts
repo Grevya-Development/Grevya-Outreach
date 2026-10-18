@@ -28,7 +28,7 @@ export interface VerifyResult {
     acceptAll: boolean | null;
     mailbox: "exists" | "missing" | "unknown" | null;
   };
-  source: "smtp" | "hunter" | "dns" | "cache";
+  source: "smtp" | "hunter" | "dns" | "cache" | "history";
   checkedAt: string;
 }
 
@@ -240,7 +240,9 @@ export async function verifyAddress(raw: string, opts: VerifyOptions = {}): Prom
 
   if (opts.useCache !== false) {
     const { data } = await db().from("email_checks").select("result, checked_at").eq("email", email).maybeSingle();
-    if (data && Date.now() - new Date(data.checked_at).getTime() < 30 * 86_400_000) return { ...(data.result as VerifyResult), source: "cache" };
+    const cached = data?.result as (VerifyResult & { v?: number }) | undefined;
+    // Only reuse results produced by the current verification logic.
+    if (cached?.v === CACHE_VERSION && Date.now() - new Date(data!.checked_at).getTime() < 30 * 86_400_000) return { ...cached, source: "cache" };
   }
 
   const mx = await mxHosts(domain);
@@ -258,14 +260,23 @@ export async function verifyAddress(raw: string, opts: VerifyOptions = {}): Prom
     return save(result(email, { status: "risky", score: 15, reason: `Looks like a typo of ${suggestion.split("@")[1]}`, suggestion }, checks, provider, "dns"));
   }
 
-  // Mailbox-level check over SMTP.
+  // Evidence we already have beats any remote check.
+  const known = await knownEvidence(email);
+  if (known) {
+    checks.mailbox = "exists";
+    return save(result(email, { status: "valid", score: 99, reason: known }, checks, provider, "history"));
+  }
+
+  // Mailbox-level check over SMTP (tries backup mail servers if the first one refuses us).
   const smtpOk = opts.useSmtp ?? (await canProbeSmtp());
+  let refused = false;
   if (smtpOk) {
-    try {
-      const fake = `zz${randomBytes(6).toString("hex")}@${domain}`;
-      const replies = await smtpProbe(mx[0], [email, fake]);
-      const real = rcptVerdict(replies.get(email));
-      const catchAll = rcptVerdict(replies.get(fake)) === "exists";
+    const fake = `zz${randomBytes(6).toString("hex")}@${domain}`;
+    const probe = await probeAny(mx, [email, fake]);
+    refused = probe.refused;
+    if (probe.replies) {
+      const real = rcptVerdict(probe.replies.get(email));
+      const catchAll = rcptVerdict(probe.replies.get(fake)) === "exists";
       checks.mailbox = real;
       checks.acceptAll = catchAll;
       if (real === "missing") {
@@ -273,16 +284,13 @@ export async function verifyAddress(raw: string, opts: VerifyOptions = {}): Prom
       }
       if (real === "exists" && !catchAll) {
         return save(result(email, {
-          status: checks.role ? "risky" : "valid", score: checks.role ? 75 : 97,
-          reason: checks.role ? "Mailbox exists, but it's a shared/role address (info@, sales@…) — replies are less likely" : "Mailbox exists",
+          status: "valid", score: checks.role ? 90 : 97,
+          reason: checks.role ? "Mailbox exists (it's a shared address like info@ — fine to email, replies come from whoever reads it)" : "Mailbox exists",
         }, checks, provider, "smtp"));
       }
       if (catchAll) {
         return save(result(email, { status: "risky", score: 60, reason: "The domain accepts every address (accept-all), so this one can't be confirmed" }, checks, provider, "smtp"));
       }
-      // Greylisted / blocked — fall through to the next method.
-    } catch {
-      // Server dropped us — fall through.
     }
   }
 
@@ -297,19 +305,57 @@ export async function verifyAddress(raw: string, opts: VerifyOptions = {}): Prom
     }
   }
 
-  // Domain-level only.
-  const reason = checks.role
-    ? "Domain receives email, but this is a shared/role address (info@, sales@…)"
-    : smtpOk
-      ? "Domain receives email; the mail server wouldn't confirm the mailbox"
-      : "Domain receives email; mailbox not checked (port 25 blocked on this network)";
-  return save(result(email, { status: checks.role ? "risky" : "unknown", score: checks.role ? 45 : checks.freeMail ? 65 : 60, reason, suggestion }, checks, provider, "dns"));
+  // Domain-level only: say precisely why the mailbox couldn't be confirmed.
+  const who = provider && !provider.includes(".") ? provider : `${domain}'s mail server`;
+  const reason = !smtpOk
+    ? "The domain accepts email, but mailbox checks need outgoing port 25, which this network blocks."
+    : refused
+      ? `${who} refuses verification checks from your current internet connection (it blocks home/office IPs), so this mailbox can't be confirmed from here. Add a free Hunter.io key in .env.local (HUNTER_API_KEY) to confirm addresses like this.`
+      : `${who} wouldn't say whether this mailbox exists (some servers hide that on purpose).`;
+  return save(result(email, { status: "unknown", score: checks.freeMail ? 65 : 60, reason, suggestion }, checks, provider, "dns"));
 }
+
+/**
+ * Proof the address is real from our own data: it's one of our connected mailboxes, the person
+ * has emailed us, or we emailed them over a day ago and it didn't bounce.
+ */
+async function knownEvidence(email: string): Promise<string | null> {
+  const supa = db();
+  const [mailbox, reply, sent, bounced] = await Promise.all([
+    supa.from("mailboxes").select("id").eq("email", email).limit(1),
+    supa.from("replies").select("received_at").eq("from_email", email).in("kind", ["reply", "auto_reply"]).limit(1),
+    supa.from("messages").select("sent_at").eq("to_email", email).eq("status", "sent").lt("sent_at", new Date(Date.now() - 86_400_000).toISOString()).order("sent_at", { ascending: false }).limit(1),
+    supa.from("messages").select("id").eq("to_email", email).eq("status", "bounced").limit(1),
+  ]);
+  if (mailbox.data?.length) return "This is one of your connected mailboxes";
+  if (reply.data?.length) return "This person has emailed you from this address";
+  if (sent.data?.length && !bounced.data?.length) {
+    return `You emailed this address on ${new Date(sent.data[0].sent_at).toLocaleDateString("en-IN", { day: "numeric", month: "short" })} and it didn't bounce`;
+  }
+  return null;
+}
+
+/** Tries up to 3 of the domain's mail servers; reports whether they all refused us outright. */
+export async function probeAny(mx: string[], addresses: string[]): Promise<{ replies: Map<string, SmtpReply> | null; refused: boolean }> {
+  let refusedAll = true;
+  for (const host of mx.slice(0, 3)) {
+    try {
+      return { replies: await smtpProbe(host, addresses), refused: false };
+    } catch (err) {
+      // "greeting 554" / connection reset = this server blocks our IP; anything else = flaky.
+      if (!/greeting 5\d\d|ECONNRESET|ECONNREFUSED|MAIL FROM refused: 5/i.test((err as Error).message)) refusedAll = false;
+    }
+  }
+  return { replies: null, refused: refusedAll };
+}
+
+const CACHE_VERSION = 2;
 
 async function save(r: VerifyResult): Promise<VerifyResult> {
   // Only cache definitive answers; "unknown" may become checkable later (other network, API key).
-  if (r.status !== "unknown") {
-    await db().from("email_checks").upsert({ email: r.email, status: r.status, score: r.score, result: r, checked_at: r.checkedAt });
+  // History-based answers are cheap to recompute, so they aren't cached either.
+  if (r.status !== "unknown" && r.source !== "history") {
+    await db().from("email_checks").upsert({ email: r.email, status: r.status, score: r.score, result: { ...r, v: CACHE_VERSION }, checked_at: r.checkedAt });
   }
   return r;
 }

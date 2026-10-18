@@ -7,7 +7,7 @@
 //     addresses published on its website
 //   • how common each pattern is across companies in general
 import { randomBytes } from "node:crypto";
-import { canProbeSmtp, hunterEnabled, mxHosts, providerFromMxHosts, smtpProbe } from "./email-verify";
+import { canProbeSmtp, hunterEnabled, mxHosts, probeAny, providerFromMxHosts } from "./email-verify";
 import { fetchPublic, FREE_MAIL } from "./research";
 import { db } from "./supabase";
 
@@ -170,7 +170,9 @@ export async function findEmail(input: { name?: string; first?: string; last?: s
     try {
       const top = candidates.slice(0, 8);
       const fake = `zz${randomBytes(6).toString("hex")}@${domain}`;
-      const replies = await smtpProbe(mx[0], [fake, ...top.map((c) => c.email)]);
+      const probe = await probeAny(mx, [fake, ...top.map((c) => c.email)]);
+      if (!probe.replies) throw new Error(probe.refused ? "refused" : "no answer");
+      const replies = probe.replies;
       acceptAll = (replies.get(fake)?.code ?? 0) === 250;
       if (acceptAll) {
         notes.push(`${domain} accepts every address (accept-all), so the mail server can't confirm which one is right — the best guess is based on patterns.`);
@@ -182,8 +184,10 @@ export async function findEmail(input: { name?: string; first?: string; last?: s
           else if (r.code >= 500 && !/5\.7\.\d|spam|block|policy/i.test(r.text)) { c.mailbox = "missing"; c.confidence = 1; }
         }
       }
-    } catch {
-      notes.push("The company's mail server didn't respond to the mailbox check — ranked by pattern instead.");
+    } catch (err) {
+      notes.push((err as Error).message === "refused"
+        ? `${provider ?? domain}'s mail server blocks verification checks from your current internet connection, so the best guess is ranked by pattern. A free Hunter.io key (HUNTER_API_KEY) can confirm it.`
+        : "The company's mail server didn't respond to the mailbox check — ranked by pattern instead.");
     }
   } else {
     notes.push("Mailbox confirmation needs outgoing port 25, which this network blocks. Results are ranked by evidence instead" +

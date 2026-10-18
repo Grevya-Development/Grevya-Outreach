@@ -130,7 +130,8 @@ function VerifyTab({ campaigns }: { campaigns: { id: string; name: string }[] })
                       {r.reason}
                       {r.suggestion && <button className="block text-accent text-[12px] hover:underline" onClick={() => setText((t) => t.replace(r.email, r.suggestion!))}>Did you mean {r.suggestion}? (fix in list)</button>}
                       <span className="flex flex-wrap gap-1 mt-1">
-                        {r.checks.role && <Badge>role address</Badge>}
+                        {r.checks.role && <Badge>shared address (info@, sales@…)</Badge>}
+                        {r.source === "history" && <Badge tone="good">from your own data</Badge>}
                         {r.checks.freeMail && <Badge>personal email</Badge>}
                         {r.checks.acceptAll && <Badge tone="warn">accept-all domain</Badge>}
                         {r.source === "cache" && <Badge>checked earlier</Badge>}

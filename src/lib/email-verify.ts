@@ -3,8 +3,7 @@
 //   2. domain: MX records, provider, disposable / role / free-mail
 //   3. mailbox: ask the recipient's mail server (SMTP RCPT TO, port 25) whether the address
 //      exists, and whether the domain accepts *any* address ("accept-all"). Many home/office
-//      networks block port 25 — then we fall back to Hunter.io (if a key is set) or report
-//      "domain OK, mailbox not checked".
+//      networks block port 25 — then we report "domain OK, mailbox not checked".
 import { randomBytes } from "node:crypto";
 import { resolveMx, resolve4 } from "node:dns/promises";
 import net from "node:net";
@@ -28,7 +27,7 @@ export interface VerifyResult {
     acceptAll: boolean | null;
     mailbox: "exists" | "missing" | "unknown" | null;
   };
-  source: "smtp" | "hunter" | "dns" | "cache" | "history";
+  source: "smtp" | "dns" | "cache" | "history";
   checkedAt: string;
 }
 
@@ -175,43 +174,6 @@ function rcptVerdict(r: SmtpReply | undefined): "exists" | "missing" | "unknown"
   return "unknown"; // 4xx: greylisting etc.
 }
 
-/* ───────────── Hunter.io (optional) ───────────── */
-
-export function hunterEnabled(): boolean {
-  return Boolean(process.env.HUNTER_API_KEY);
-}
-
-async function hunterVerify(email: string): Promise<{ status: VerifyStatus; score: number; acceptAll: boolean; mailbox: "exists" | "missing" | "unknown" } | null> {
-  const key = process.env.HUNTER_API_KEY;
-  if (!key) return null;
-  const res = await fetch(`https://api.hunter.io/v2/email-verifier?email=${encodeURIComponent(email)}&api_key=${key}`, { signal: AbortSignal.timeout(30_000) });
-  if (res.status === 429 || res.status === 402) return null; // out of credits
-  if (!res.ok) return null;
-  const d = (await res.json()).data as { status?: string; score?: number };
-  const score = Number(d.score ?? 0);
-  switch (d.status) {
-    case "valid": return { status: "valid", score: Math.max(score, 85), acceptAll: false, mailbox: "exists" };
-    case "invalid": return { status: "invalid", score: Math.min(score, 10), acceptAll: false, mailbox: "missing" };
-    case "accept_all": return { status: "risky", score, acceptAll: true, mailbox: "unknown" };
-    case "webmail": return { status: score >= 70 ? "valid" : "unknown", score, acceptAll: false, mailbox: score >= 70 ? "exists" : "unknown" };
-    case "disposable": return { status: "invalid", score: 5, acceptAll: false, mailbox: "unknown" };
-    default: return { status: "unknown", score, acceptAll: false, mailbox: "unknown" };
-  }
-}
-
-export async function hunterCredits(): Promise<{ searches: number; verifications: number } | null> {
-  const key = process.env.HUNTER_API_KEY;
-  if (!key) return null;
-  try {
-    const res = await fetch(`https://api.hunter.io/v2/account?api_key=${key}`, { signal: AbortSignal.timeout(15_000) });
-    if (!res.ok) return null;
-    const r = (await res.json()).data?.requests;
-    return { searches: Number(r?.searches?.available ?? 0) - Number(r?.searches?.used ?? 0), verifications: Number(r?.verifications?.available ?? 0) - Number(r?.verifications?.used ?? 0) };
-  } catch {
-    return null;
-  }
-}
-
 /* ───────────── main entry ───────────── */
 
 const result = (email: string, partial: Partial<VerifyResult> & Pick<VerifyResult, "status" | "score" | "reason">, checks: VerifyResult["checks"], provider: string | null, source: VerifyResult["source"]): VerifyResult => ({
@@ -220,7 +182,6 @@ const result = (email: string, partial: Partial<VerifyResult> & Pick<VerifyResul
 
 export interface VerifyOptions {
   useSmtp?: boolean;   // default: when port 25 is reachable
-  useHunter?: boolean; // default: when a key is set and SMTP isn't available
   useCache?: boolean;  // default true (30 days)
 }
 
@@ -294,23 +255,12 @@ export async function verifyAddress(raw: string, opts: VerifyOptions = {}): Prom
     }
   }
 
-  if (opts.useHunter ?? hunterEnabled()) {
-    const h = await hunterVerify(email).catch(() => null);
-    if (h) {
-      checks.mailbox = h.mailbox;
-      checks.acceptAll = h.acceptAll;
-      const reason = h.status === "valid" ? "Mailbox exists (verified via Hunter)" : h.status === "invalid" ? "Mailbox doesn't exist (verified via Hunter)"
-        : h.acceptAll ? "The domain accepts every address, so this one can't be confirmed" : "Couldn't confirm the mailbox";
-      return save(result(email, { status: h.status, score: h.score, reason, suggestion }, checks, provider, "hunter"));
-    }
-  }
-
   // Domain-level only: say precisely why the mailbox couldn't be confirmed.
   const who = provider && !provider.includes(".") ? provider : `${domain}'s mail server`;
   const reason = !smtpOk
     ? "The domain accepts email, but mailbox checks need outgoing port 25, which this network blocks."
     : refused
-      ? `${who} refuses verification checks from your current internet connection (it blocks home/office IPs), so this mailbox can't be confirmed from here. Add a free Hunter.io key in .env.local (HUNTER_API_KEY) to confirm addresses like this.`
+      ? `${who} refuses verification checks from your current internet connection (it blocks home/office IPs), so this mailbox can't be confirmed from here. It will be checked automatically when the app runs on a server (e.g. a VPS).`
       : `${who} wouldn't say whether this mailbox exists (some servers hide that on purpose).`;
   return save(result(email, { status: "unknown", score: checks.freeMail ? 65 : 60, reason, suggestion }, checks, provider, "dns"));
 }

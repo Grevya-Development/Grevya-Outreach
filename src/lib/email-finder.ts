@@ -1,13 +1,12 @@
 // Email finder: name + company domain → the person's most likely address.
 // Evidence, strongest first:
 //   • the mail server confirms the mailbox (SMTP, when port 25 is reachable)
-//   • Hunter.io's finder (when a key is set)
 //   • the address is published on the company's website
 //   • the company's email pattern, learned from leads you already have there or from
 //     addresses published on its website
 //   • how common each pattern is across companies in general
 import { randomBytes } from "node:crypto";
-import { canProbeSmtp, hunterEnabled, mxHosts, probeAny, providerFromMxHosts } from "./email-verify";
+import { canProbeSmtp, mxHosts, probeAny, providerFromMxHosts } from "./email-verify";
 import { fetchPublic, FREE_MAIL } from "./research";
 import { db } from "./supabase";
 
@@ -27,7 +26,7 @@ export interface FindResult {
   acceptAll: boolean | null;
   best: Candidate | null;
   candidates: Candidate[];
-  method: "smtp" | "hunter" | "pattern";
+  method: "smtp" | "pattern";
   notes: string[];
 }
 
@@ -86,16 +85,6 @@ async function websiteEmails(domain: string): Promise<string[]> {
   return [...found];
 }
 
-async function hunterFind(domain: string, first: string, last: string): Promise<{ email: string; score: number } | null> {
-  const key = process.env.HUNTER_API_KEY;
-  if (!key || !first) return null;
-  const url = `https://api.hunter.io/v2/email-finder?domain=${encodeURIComponent(domain)}&first_name=${encodeURIComponent(first)}&last_name=${encodeURIComponent(last)}&api_key=${key}`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(30_000) }).catch(() => null);
-  if (!res?.ok) return null;
-  const d = (await res.json()).data as { email?: string; score?: number } | undefined;
-  return d?.email ? { email: d.email.toLowerCase(), score: Number(d.score ?? 0) } : null;
-}
-
 export async function findEmail(input: { name?: string; first?: string; last?: string; domain: string }): Promise<FindResult | { ok: false; error: string }> {
   const split = input.name ? splitPersonName(input.name) : { first: clean(input.first ?? ""), last: clean(input.last ?? "") };
   const first = input.first ? clean(input.first) : split.first;
@@ -147,6 +136,8 @@ export async function findEmail(input: { name?: string; first?: string; last?: s
     const local = p.make(first, last);
     if (local) candidates.push({ email: `${local}@${domain}`, pattern: p.key, confidence: 0, evidence: evidence.get(p.key) ?? [], mailbox: "unknown" });
   }
+  // Two patterns can produce the same address (e.g. one-letter last names) — keep the first.
+  candidates = candidates.filter((c, i) => candidates.findIndex((x) => x.email === c.email) === i);
   const total = [...scores.values()].reduce((a, b) => a + b, 0) || 1;
   for (const c of candidates) c.confidence = Math.round(((scores.get(c.pattern) ?? 0) / total) * 100);
   candidates.sort((a, b) => b.confidence - a.confidence);
@@ -154,18 +145,7 @@ export async function findEmail(input: { name?: string; first?: string; last?: s
   let method: FindResult["method"] = "pattern";
   let acceptAll: boolean | null = null;
 
-  // 3) Hunter.io, if configured.
-  if (hunterEnabled()) {
-    const h = await hunterFind(domain, first, last);
-    if (h) {
-      const hit = candidates.find((c) => c.email === h.email);
-      if (hit) { hit.confidence = Math.max(hit.confidence, h.score); hit.evidence.unshift(`Hunter.io found it (score ${h.score})`); }
-      else candidates.unshift({ email: h.email, pattern: "hunter", confidence: h.score, evidence: [`Hunter.io found it (score ${h.score})`], mailbox: "unknown" });
-      method = "hunter";
-    }
-  }
-
-  // 4) Ask the mail server (strongest evidence), when port 25 works.
+  // 3) Ask the mail server (strongest evidence), when port 25 works.
   if (await canProbeSmtp()) {
     try {
       const top = candidates.slice(0, 8);
@@ -186,12 +166,11 @@ export async function findEmail(input: { name?: string; first?: string; last?: s
       }
     } catch (err) {
       notes.push((err as Error).message === "refused"
-        ? `${provider ?? domain}'s mail server blocks verification checks from your current internet connection, so the best guess is ranked by pattern. A free Hunter.io key (HUNTER_API_KEY) can confirm it.`
+        ? `${provider ?? domain}'s mail server blocks verification checks from your current internet connection, so the best guess is ranked by pattern.`
         : "The company's mail server didn't respond to the mailbox check — ranked by pattern instead.");
     }
   } else {
-    notes.push("Mailbox confirmation needs outgoing port 25, which this network blocks. Results are ranked by evidence instead" +
-      (hunterEnabled() ? "." : " — add a free Hunter.io key (HUNTER_API_KEY) or run the app on a server to confirm addresses."));
+    notes.push("Mailbox confirmation needs outgoing port 25, which this network blocks — results are ranked by evidence instead. Running the app on a server enables confirmation.");
   }
 
   candidates = candidates.filter((c) => c.mailbox !== "missing").sort((a, b) => b.confidence - a.confidence);

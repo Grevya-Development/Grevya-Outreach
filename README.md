@@ -19,7 +19,6 @@ Self-hosted cold email: sends personalised sequences from your own mailboxes (in
   - **Checks:** syntax and typos (gmial.com → gmail.com), mail server, disposable and role addresses, and whether the mailbox really exists (asked of the company's mail server over SMTP; nothing is sent). Accept-all domains are detected.
   - **Find someone's email:** from first name, last name and company domain, it builds the likely formats and learns the company's pattern from your existing leads and its website, then confirms with the mail server.
   - **Saving:** results go straight to Leads or a campaign.
-  - **Hunter.io (optional):** add `HUNTER_API_KEY` for extra coverage.
   - **Port 25 required:** mailbox checks need outgoing port 25. Many networks and clouds block it; the app detects this and falls back gracefully.
 - **Template mode:** `{{variables}}`, `{Hi|Hey}` spintax and an optional one-line AI opener.
 - **Mailboxes:** any SMTP/IMAP inbox; GoDaddy is auto-detected from MX.

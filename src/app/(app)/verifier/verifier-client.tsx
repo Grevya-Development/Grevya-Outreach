@@ -29,10 +29,6 @@ export function VerifierView({ capabilities: cap, campaigns }: { capabilities: V
           <b>Mailbox check:</b>
           <span className="text-muted">{cap.smtp ? "on — we ask each company's mail server whether the mailbox exists (nothing is sent)" : "off — outgoing port 25 is blocked on this network, so we check the domain only"}</span>
         </span>
-        <span className="flex items-center gap-1.5">
-          <b>Hunter.io:</b>
-          <span className="text-muted">{cap.hunter ? (cap.hunterCredits ? `connected · ${cap.hunterCredits.searches} finds, ${cap.hunterCredits.verifications} verifications left this month` : "connected") : "not connected (optional — add HUNTER_API_KEY for extra coverage)"}</span>
-        </span>
       </Card>
 
       <div className="flex gap-1 border-b border-line">
@@ -224,7 +220,6 @@ function FindTab({ campaigns }: { campaigns: { id: string; name: string }[] }) {
             <div>1. Builds the common formats (priya.sharma@, priya@, psharma@ …).</div>
             <div>2. Learns the company&apos;s format from leads you already have there and from addresses on its website.</div>
             <div>3. Asks the company&apos;s mail server which one exists (nothing is sent){" "}and spots &ldquo;accept-all&rdquo; domains where no address can be confirmed.</div>
-            <div>4. Uses Hunter.io too, if connected.</div>
           </Card>
         )}
       </div>

@@ -41,6 +41,7 @@ function base() {
 }
 
 async function InboxData({ params }: { params: PageProps<"/inbox">["searchParams"] }) {
+  await connection(); // filters use the current time — render at request time
   const sp = await params;
   const filter = typeof sp.f === "string" && sp.f in FILTERS ? sp.f : "todo";
   const [rows, counts] = await Promise.all([

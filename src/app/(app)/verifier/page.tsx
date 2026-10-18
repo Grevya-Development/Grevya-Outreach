@@ -1,7 +1,7 @@
 import { connection } from "next/server";
 import { Suspense } from "react";
 import { PageHeader, Skeleton } from "@/components/ui";
-import { canProbeSmtp, hunterCredits, hunterEnabled } from "@/lib/email-verify";
+import { canProbeSmtp } from "@/lib/email-verify";
 import { db, must } from "@/lib/supabase";
 import { VerifierView } from "./verifier-client";
 
@@ -20,10 +20,9 @@ export default function VerifierPage() {
 
 async function VerifierData() {
   await connection();
-  const [smtp, credits, campaigns] = await Promise.all([
+  const [smtp, campaigns] = await Promise.all([
     canProbeSmtp(),
-    hunterCredits(),
     db().from("campaigns").select("id, name").neq("status", "completed").order("created_at", { ascending: false }).then(must),
   ]);
-  return <VerifierView capabilities={{ smtp, hunter: hunterEnabled(), hunterCredits: credits }} campaigns={campaigns as { id: string; name: string }[]} />;
+  return <VerifierView capabilities={{ smtp }} campaigns={campaigns as { id: string; name: string }[]} />;
 }

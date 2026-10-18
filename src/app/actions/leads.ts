@@ -96,8 +96,7 @@ export async function verifyLeads(ids?: string[]): Promise<ActionResult> {
   const results: { id: string; status: string }[] = [];
   for (let i = 0; i < leads.length; i += 5) {
     const batch = leads.slice(i, i + 5);
-    // Hunter credits are reserved for the Verifier page; bulk lead checks use free methods.
-    const rs = await Promise.all(batch.map((l) => verifyAddress(l.email, { useHunter: false })));
+    const rs = await Promise.all(batch.map((l) => verifyAddress(l.email)));
     batch.forEach((l, j) => results.push({ id: l.id, status: rs[j].status }));
   }
   for (const status of ["valid", "invalid", "risky", "unknown"]) {

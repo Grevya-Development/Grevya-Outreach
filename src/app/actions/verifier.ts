@@ -2,21 +2,18 @@
 
 import { refresh } from "next/cache";
 import type { ActionResult } from "@/components/client";
-import { canProbeSmtp, hunterCredits, hunterEnabled, verifyAddress, type VerifyResult } from "@/lib/email-verify";
+import { canProbeSmtp, verifyAddress, type VerifyResult } from "@/lib/email-verify";
 import { findEmail, type FindResult } from "@/lib/email-finder";
 import { db, must } from "@/lib/supabase";
 import { requireAuth } from "./auth";
 
 export interface VerifierCapabilities {
   smtp: boolean;
-  hunter: boolean;
-  hunterCredits: { searches: number; verifications: number } | null;
 }
 
 export async function verifierCapabilities(): Promise<VerifierCapabilities> {
   await requireAuth();
-  const [smtp, credits] = await Promise.all([canProbeSmtp(), hunterCredits()]);
-  return { smtp, hunter: hunterEnabled(), hunterCredits: credits };
+  return { smtp: await canProbeSmtp() };
 }
 
 /** Verifies up to 25 addresses per call (the page calls this in batches to show progress). */

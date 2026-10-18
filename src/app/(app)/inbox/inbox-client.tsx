@@ -1,261 +1,442 @@
 "use client";
 
-import { AlarmClock, Check, CornerUpLeft, Inbox, PenLine, RotateCcw, Send, Sparkles, StickyNote } from "lucide-react";
-import { usePathname, useRouter } from "next/navigation";
-import { useEffect, useOptimistic, useState, useTransition } from "react";
+import { AlarmClock, Bot, Check, CornerUpLeft, Inbox, Mail, Mails, Search, SlidersHorizontal, TriangleAlert } from "lucide-react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { useEffect, useOptimistic, useRef, useState, useSyncExternalStore, useTransition } from "react";
 import { toast } from "sonner";
-import { markReply } from "@/app/actions/misc";
-import { getThread, replyTo, saveNote, sendOneOff, setFollowUp, setHandled, suggestReply, type ThreadItem } from "@/app/actions/inbox";
-import { Dialog, Spinner, useAction } from "@/components/client";
-import { Badge, Button, Card, Empty, Field, Input, Select, StatusBadge, Textarea, cx, timeAgo } from "@/components/ui";
-import type { Mailbox, Reply } from "@/lib/types";
+import { RelativeTime, ShortcutHelp, Spinner, useHotkeys, usePoll } from "@/components/client";
+import { publishTodoCount } from "@/components/nav";
+import { Badge, Button, ButtonLink, Card, Empty, Select, cx, inputClass, type Tone } from "@/components/ui";
+import { fmtDate, fmtDay, fmtNum } from "@/lib/format";
+import type { FilterOptions, InboxCounts, InboxRow, InboxView as View } from "@/lib/inbox-data";
+import { replyLabel, REPLY_KIND_LABEL, REPLY_LABELS } from "@/lib/labels";
+import type { Reply } from "@/lib/types";
+import { Conversation, type ChangeRow } from "./conversation";
 
-export type InboxRow = { campaigns: { name: string } | null; mailboxes: { email: string } | null };
-type Row = Reply & InboxRow;
+export type InboxFilter = { f: View; label: string; campaign: string; account: string; q: string };
 
-const FILTERS = [
-  { key: "todo", label: "Needs reply" },
-  { key: "due", label: "Follow-ups due" },
-  { key: "later", label: "Snoozed" },
-  { key: "interested", label: "Interested" },
-  { key: "done", label: "Done" },
-  { key: "auto", label: "Auto-replies & bounces" },
-  { key: "all", label: "All" },
+const PAGE = 50;
+const POLL_MS = 30_000;
+/** A server payload older than this came from the router cache: fetch the list again once. */
+const STALE_MS = 5_000;
+const WIDE = "(min-width: 768px)";
+
+const VIEWS: { key: View; label: string; icon: typeof Inbox }[] = [
+  { key: "todo", label: "To do", icon: Inbox },
+  { key: "reminders", label: "Reminder set", icon: AlarmClock },
+  { key: "done", label: "Done", icon: Check },
+  { key: "auto", label: "Auto-replies & bounces", icon: Bot },
+  { key: "all", label: "All", icon: Mails },
 ];
 
-const EMPTY: Record<string, { title: string; body: string }> = {
-  todo: { title: "You're all caught up", body: "New replies land here within a few minutes. Answer them, set a reminder, or mark them done." },
-  due: { title: "No follow-ups due", body: "Use “Remind me” on a conversation and it comes back here on that day." },
-  later: { title: "Nothing snoozed", body: "" },
+const EMPTY: Record<View, { title: string; body: string }> = {
+  todo: { title: "Inbox zero", body: "New replies show up here within a few minutes." },
+  reminders: { title: "No reminders set", body: "Use Remind me on a conversation and it comes back to To do on that day." },
+  done: { title: "Nothing done yet", body: "Conversations you answer or mark done move here." },
+  auto: { title: "No auto-replies or bounces", body: "Out-of-office replies and bounced emails land here, away from your To do." },
+  all: { title: "No replies yet", body: "Replies to your emails show up here within a few minutes." },
 };
 
-export function InboxView({ replies, filter, counts, initialId }: { replies: Row[]; filter: string; counts: Record<string, number>; initialId?: string }) {
+const SHORTCUTS: [string, string][] = [
+  ["j", "Next conversation"],
+  ["k", "Previous conversation"],
+  ["enter", "Open the selected conversation"],
+  ["r", "Write a reply"],
+  ["mod+enter", "Send reply"],
+  ["e", "Done"],
+  ["h", "Remind me"],
+  ["1-6", REPLY_LABELS.map((l) => l.label).join(" · ")],
+  ["/", "Search"],
+  ["?", "Show shortcuts"],
+];
+
+function filterParams(f: InboxFilter, extra?: Record<string, string>): URLSearchParams {
+  const sp = new URLSearchParams();
+  if (f.f !== "todo") sp.set("f", f.f);
+  if (f.label) sp.set("label", f.label);
+  if (f.campaign) sp.set("campaign", f.campaign);
+  if (f.account) sp.set("account", f.account);
+  if (f.q) sp.set("q", f.q);
+  for (const [k, v] of Object.entries(extra ?? {})) sp.set(k, v);
+  return sp;
+}
+
+function inboxHref(f: InboxFilter): string {
+  const qs = filterParams(f).toString();
+  return qs ? `/inbox?${qs}` : "/inbox";
+}
+
+async function fetchList(f: InboxFilter, extra: Record<string, string>, signal?: AbortSignal): Promise<{ rows: InboxRow[]; counts: InboxCounts | null }> {
+  const res = await fetch(`/api/inbox/list?${filterParams(f, extra)}`, { signal, cache: "no-store" });
+  if (!res.ok) throw new Error(((await res.json().catch(() => null)) as { error?: string } | null)?.error || "Couldn't load conversations");
+  return res.json();
+}
+
+/** Adds rows that aren't in the list yet (polls and pages can overlap). */
+function merge(list: InboxRow[], add: InboxRow[], where: "start" | "end"): InboxRow[] {
+  const have = new Set(list.map((r) => r.id));
+  const fresh = add.filter((r) => !have.has(r.id));
+  return where === "start" ? [...fresh, ...list] : [...list, ...fresh];
+}
+
+function subscribeWide(cb: () => void) {
+  const mq = window.matchMedia(WIDE);
+  mq.addEventListener("change", cb);
+  return () => mq.removeEventListener("change", cb);
+}
+
+/** Reminder chip text: Today / Overdue / '25 Oct'. */
+function reminderChip(iso: string, now: number): { text: string; tone: Tone } {
+  if (fmtDate(iso, { year: true }) === fmtDate(now, { year: true })) return { text: "Today", tone: "warn" };
+  if (Date.parse(iso) < now) return { text: "Overdue", tone: "bad" };
+  return { text: fmtDate(iso), tone: "neutral" };
+}
+
+export function InboxView({ rows: serverRows, hasMore: serverHasMore, cursor: serverCursor, counts: serverCounts, options, filter, initialId, renderedAt }: {
+  rows: InboxRow[];
+  hasMore: boolean;
+  cursor: { newest: string | null; oldest: string | null };
+  counts: InboxCounts;
+  options: FilterOptions;
+  filter: InboxFilter;
+  initialId?: string;
+  renderedAt: number;
+}) {
   const router = useRouter();
-  const pathname = usePathname();
-  const [, start] = useTransition();
-  const [selectedId, setSelectedId] = useState(initialId ?? replies[0]?.id);
-  const [rows, patch] = useOptimistic(replies, (state, p: { id: string } & Partial<Reply>) => state.map((r) => (r.id === p.id ? { ...r, ...p } : r)));
-  const selected = rows.find((r) => r.id === selectedId) ?? rows[0];
+  const [pending, start] = useTransition();
+  const [shown, setShown] = useOptimistic(filter);
+
+  // A deep link (?id=) counts as opening the conversation, so it starts out read.
+  const [deepLinkUnread] = useState(() => serverRows.find((r) => r.id === initialId && !r.is_read)?.id ?? null);
+  const [rows, setRows] = useState(() => serverRows.map((r) => (r.id === deepLinkUnread ? { ...r, is_read: true } : r)));
+  const [counts, setCounts] = useState(serverCounts);
+  // Keep the sidebar's To do pill in step (inbox writes don't refresh the layout).
+  useEffect(() => { publishTodoCount(counts.todo); }, [counts.todo]);
+  const [hasMore, setHasMore] = useState(serverHasMore);
+  const [cursor, setCursor] = useState(serverCursor);
+  /** undefined = nothing chosen (desktop shows the first row), null = closed. */
+  const [picked, setPicked] = useState<string | null | undefined>(initialId);
+  const [now, setNow] = useState(renderedAt);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [showFilters, setShowFilters] = useState(false);
+  const [search, setSearch] = useState(filter.q);
+  const searchBox = useRef<HTMLInputElement>(null);
+  const searchTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const liveFilter = useRef(filter);
+
+  // A new server payload (another view or filter): start over from it.
+  const [payload, setPayload] = useState(serverRows);
+  if (payload !== serverRows) {
+    setPayload(serverRows);
+    setRows(serverRows);
+    setCounts(serverCounts);
+    setHasMore(serverHasMore);
+    setCursor(serverCursor);
+    setPicked(initialId);
+    setNow(renderedAt);
+  }
+
+  // Auto-selection is for desktop only; on phones the list shows until you tap a conversation.
+  const wide = useSyncExternalStore(subscribeWide, () => window.matchMedia(WIDE).matches, () => false);
+  const selected = (picked ? rows.find((r) => r.id === picked) : undefined) ?? (picked === undefined && wide ? rows[0] : undefined);
+
+  useEffect(() => { liveFilter.current = filter; });
+
+  const postRead = (id: string) => {
+    void fetch("/api/inbox/read", { method: "POST", body: JSON.stringify({ id }), keepalive: true, headers: { "content-type": "application/json" } }).catch(() => {});
+  };
 
   useEffect(() => {
-    if (selected && !selected.is_read) {
-      start(async () => { patch({ id: selected.id, is_read: true }); await markReply(selected.id, { is_read: true }); });
-    }
+    if (deepLinkUnread) postRead(deepLinkUnread);
+  }, [deepLinkUnread]);
+
+  // Served from the router cache (e.g. Back to the inbox): bring the list up to date once.
+  useEffect(() => {
+    if (Date.now() - renderedAt <= STALE_MS) return;
+    const ac = new AbortController();
+    fetchList(filter, { full: "1" }, ac.signal).then((d) => {
+      setRows((cur) => {
+        const keep = cur.find((r) => r.id === picked && !d.rows.some((x) => x.id === r.id));
+        return keep ? [keep, ...d.rows] : d.rows;
+      });
+      if (d.counts) setCounts(d.counts);
+      setHasMore(d.rows.length >= PAGE);
+      setCursor({ newest: d.rows[0]?.received_at ?? null, oldest: d.rows.at(-1)?.received_at ?? null });
+      setNow(Date.now());
+    }).catch(() => {});
+    return () => ac.abort();
+    // Only when a new payload arrives; `picked` is read at that moment.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected?.id]);
+  }, [renderedAt, filter]);
 
-  return (
-    <div className="grid gap-3">
-      <div className="flex flex-wrap gap-1.5">
-        {FILTERS.map((f) => (
-          <button key={f.key} onClick={() => start(() => router.replace(`${pathname}?f=${f.key}`, { scroll: false }))}
-            className={cx("h-7 px-2.5 rounded-full text-[12.5px] border transition-colors inline-flex items-center gap-1.5",
-              filter === f.key ? "bg-ink text-bg border-ink" : "border-line text-muted hover:text-ink hover:bg-panel")}>
-            {f.label}
-            {counts[f.key] ? <span className={cx("tabular-nums rounded-full px-1.5 text-[11px]", filter === f.key ? "bg-bg/20" : f.key === "due" ? "bg-warn-soft text-warn" : "bg-panel-2")}>{counts[f.key]}</span> : null}
-          </button>
-        ))}
-      </div>
+  // New replies: only add what's new, never reload the list.
+  usePoll(async () => {
+    if (pending) return;
+    const at = filter;
+    const d = await fetchList(at, cursor.newest ? { since: cursor.newest } : { full: "1" });
+    if (liveFilter.current !== at) return; // the view changed meanwhile
+    if (d.rows.length) {
+      setRows((cur) => merge(cur, d.rows, "start"));
+      setCursor((c) => ({ newest: d.rows[0].received_at, oldest: c.oldest ?? d.rows.at(-1)?.received_at ?? null }));
+    }
+    if (d.counts) setCounts(d.counts);
+    setNow(Date.now());
+  }, POLL_MS);
 
-      {rows.length === 0 ? (
-        <Card><Empty icon={<Inbox size={28} />} title={EMPTY[filter]?.title ?? "Nothing here"}>{EMPTY[filter]?.body ?? ""}</Empty></Card>
-      ) : (
-        <div className="grid md:grid-cols-[340px_minmax(0,1fr)] gap-4 items-start">
-          <Card className="overflow-hidden md:max-h-[calc(100vh-210px)] md:overflow-y-auto">
-            {rows.map((r) => (
-              <button key={r.id} onClick={() => setSelectedId(r.id)}
-                className={cx("w-full text-left px-3.5 py-3 border-b border-line last:border-0 transition-colors",
-                  selected?.id === r.id ? "bg-accent-soft/60" : "hover:bg-panel-2/60")}>
-                <div className="flex items-center gap-2">
-                  {!r.is_read && <span className="size-1.5 rounded-full bg-accent shrink-0" />}
-                  <span className={cx("truncate flex-1", !r.is_read && "font-semibold")}>{r.from_name || r.from_email}</span>
-                  <span className="text-[11.5px] text-faint tabular-nums shrink-0">{timeAgo(r.received_at)}</span>
-                </div>
-                <div className="text-[12.5px] text-muted truncate mt-0.5">{r.snippet || r.subject}</div>
-                <div className="flex flex-wrap gap-1 mt-1.5">
-                  {r.kind !== "reply" && <StatusBadge status={r.kind} />}
-                  {r.sentiment && r.sentiment !== "neutral" && <StatusBadge status={r.sentiment} />}
-                  {r.answered_at && <Badge tone="good">replied</Badge>}
-                  {r.follow_up_at && !r.handled && (
-                    <Badge tone={new Date(r.follow_up_at) <= new Date() ? "warn" : "neutral"}><AlarmClock size={11} />{followUpLabel(r.follow_up_at)}</Badge>
-                  )}
-                  {r.campaigns?.name && <span className="text-[11.5px] text-faint truncate">{r.campaigns.name}</span>}
-                </div>
-              </button>
-            ))}
-          </Card>
-          {selected && <Conversation key={selected.id} reply={selected} onPatch={(p) => patch({ id: selected.id, ...p })} />}
-        </div>
-      )}
-    </div>
-  );
-}
+  /**
+   * Opens a conversation the user chose (null closes it): keeps ?id= in the address bar without a
+   * server round-trip, and marks it read. Desktop auto-selection doesn't go through here, so it never marks anything read.
+   */
+  const open = (id: string | null) => {
+    setPicked(id);
+    const url = new URL(window.location.href);
+    if (id) url.searchParams.set("id", id);
+    else url.searchParams.delete("id");
+    window.history.replaceState(null, "", `${url.pathname}${url.search}`);
+    if (!id) return;
+    document.getElementById(`reply-${id}`)?.scrollIntoView({ block: "nearest" });
+    if (rows.some((r) => r.id === id && !r.is_read)) {
+      setRows((cur) => cur.map((r) => (r.id === id ? { ...r, is_read: true } : r)));
+      postRead(id);
+    }
+  };
 
-function followUpLabel(iso: string): string {
-  const d = new Date(iso);
-  const days = Math.round((new Date(d.toDateString()).getTime() - new Date(new Date().toDateString()).getTime()) / 86_400_000);
-  if (days < 0) return "overdue";
-  if (days === 0) return "today";
-  if (days === 1) return "tomorrow";
-  return d.toLocaleDateString(undefined, { day: "numeric", month: "short" });
-}
+  const go = (patch: Partial<InboxFilter>) => {
+    const next = { ...shown, ...patch };
+    start(() => {
+      setShown(next);
+      router.replace(inboxHref(next), { scroll: false });
+    });
+  };
 
-function inDays(n: number): string {
-  const d = new Date();
-  d.setDate(d.getDate() + n);
-  d.setHours(9, 0, 0, 0);
-  return d.toISOString();
-}
+  useEffect(() => () => clearTimeout(searchTimer.current), []); // a search typed just before leaving the page
 
-function Conversation({ reply: r, onPatch }: { reply: Row; onPatch: (p: Partial<Reply>) => void }) {
-  const [thread, setThread] = useState<ThreadItem[] | null>(null);
-  const [draft, setDraft] = useState("");
-  const [note, setNote] = useState(r.note ?? "");
-  const [suggesting, startSuggest] = useTransition();
-  const [sending, runSend] = useAction();
-  const [, startQuiet] = useTransition();
-  const [, runAction] = useAction();
-  const [pickDate, setPickDate] = useState(false);
+  const onSearch = (v: string) => {
+    setSearch(v);
+    clearTimeout(searchTimer.current);
+    searchTimer.current = setTimeout(() => go({ q: v.trim() }), 300);
+  };
 
+  const loadMore = async () => {
+    if (!cursor.oldest) return;
+    setLoadingMore(true);
+    try {
+      const d = await fetchList(filter, { before: cursor.oldest });
+      setRows((cur) => merge(cur, d.rows, "end"));
+      setHasMore(d.rows.length >= PAGE);
+      setCursor((c) => ({ ...c, oldest: d.rows.at(-1)?.received_at ?? c.oldest }));
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
+  /** Local change to a conversation. Leaving To do (Done, Send, a future reminder) opens the next one. */
+  const change = (id: string): ChangeRow => (patch, leaves = false) => {
+    const index = rows.findIndex((r) => r.id === id);
+    const before = rows[index];
+    if (!before) return () => {};
+    if (leaves && filter.f === "todo") {
+      const rest = rows.filter((r) => r.id !== id);
+      const next = rest[index] ?? rest[index - 1];
+      setRows(rest);
+      setCounts((c) => ({ ...c, todo: Math.max(0, c.todo - 1) }));
+      open(next?.id ?? null);
+      return () => {
+        setRows((cur) => (cur.some((r) => r.id === id) ? cur : [...cur.slice(0, index), before, ...cur.slice(index)]));
+        setCounts((c) => ({ ...c, todo: c.todo + 1 }));
+      };
+    }
+    const old = Object.fromEntries(Object.keys(patch).map((k) => [k, before[k as keyof Reply]])) as Partial<Reply>;
+    setRows((cur) => cur.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+    return () => setRows((cur) => cur.map((r) => (r.id === id ? { ...r, ...old } : r)));
+  };
+
+  const step = (d: 1 | -1) => {
+    if (!rows.length) return;
+    const i = selected ? rows.findIndex((r) => r.id === selected.id) : -1;
+    const next = rows[Math.min(rows.length - 1, Math.max(0, i + d))];
+    if (next) open(next.id);
+  };
+
+  useHotkeys({
+    j: () => step(1),
+    k: () => step(-1),
+    "/": () => searchBox.current?.focus(),
+  });
+
+  // Enter opens the selected conversation, but only when nothing else has focus (a focused button keeps its own Enter).
+  const enter = useRef<() => void>(() => {});
+  useEffect(() => { enter.current = () => { if (selected) open(selected.id); }; });
   useEffect(() => {
-    let alive = true;
-    getThread(r.id).then((t) => alive && setThread(t)).catch(() => alive && setThread([]));
-    return () => { alive = false; };
-  }, [r.id]);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Enter" || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey || e.isComposing) return;
+      if (e.target !== document.body || document.querySelector("dialog[open]")) return;
+      e.preventDefault();
+      enter.current();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
-  const suggest = () => startSuggest(async () => {
-    const res = await suggestReply(r.id);
-    if (!res.ok) return void toast.error(res.error);
-    setDraft(res.text);
-  });
+  const filtersOn = [shown.label, shown.campaign, shown.account].filter(Boolean).length;
+  const searching = !!filter.q || filtersOn > 0;
+  const noDetection = options.mailboxes.filter((m) => !m.imap_host || m.status === "error");
+  const viewCount = (k: View) => counts[k];
 
-  const remind = (iso: string | null) => runAction(async () => {
-    onPatch({ follow_up_at: iso, handled: false });
-    return setFollowUp(r.id, iso);
-  });
-
-  const canReply = r.kind === "reply" || r.kind === "auto_reply";
   return (
-    <Card className="fade-in overflow-hidden">
-      <div className="flex flex-wrap items-start justify-between gap-3 px-5 pt-4 pb-3 border-b border-line">
-        <div className="min-w-0">
-          <div className="text-[15px] font-semibold">{r.from_name || r.from_email}</div>
-          <div className="text-[12.5px] text-muted mt-0.5 truncate">
-            {r.from_email}{r.mailboxes?.email && <> → {r.mailboxes.email}</>}{r.campaigns?.name && <> · {r.campaigns.name}</>}
-          </div>
+    <div className="grid gap-4 items-start md:grid-cols-[280px_minmax(0,1fr)] xl:grid-cols-[190px_320px_minmax(0,1fr)]">
+      {/* Views and filters: a row of chips on smaller screens, a rail on wide ones */}
+      <div className={cx("grid gap-3 min-w-0 md:col-span-2 xl:col-span-1 xl:sticky xl:top-6", selected && "max-md:hidden")}>
+        <div className="flex items-center gap-2 min-w-0">
+          <nav aria-label="Views" className="flex xl:flex-col gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden min-w-0 flex-1">
+            {VIEWS.map(({ key, label, icon: Icon }) => {
+              const active = shown.f === key;
+              const n = viewCount(key);
+              return (
+                <button key={key} type="button" onClick={() => go({ f: key })} aria-current={active ? "page" : undefined}
+                  className={cx("shrink-0 inline-flex items-center gap-2 h-8 px-2.5 rounded-lg text-[13px] whitespace-nowrap transition-colors",
+                    "max-xl:rounded-full max-xl:border xl:w-full",
+                    active ? "bg-ink text-bg max-xl:border-ink font-medium" : "max-xl:border-line text-muted hover:text-ink hover:bg-panel-2")}>
+                  <Icon size={14} className="hidden xl:block shrink-0" />
+                  <span className="xl:flex-1 xl:text-left">{label}</span>
+                  {n ? (
+                    <span className={cx("tabular-nums rounded-full px-1.5 text-[11px] leading-[18px]",
+                      active ? "bg-bg/20" : key === "todo" ? "bg-accent text-accent-ink" : "bg-panel-2 text-muted")}>{fmtNum(n)}</span>
+                  ) : null}
+                </button>
+              );
+            })}
+          </nav>
+          {pending && <Spinner className="text-muted shrink-0 xl:hidden" />}
         </div>
-        <div className="flex flex-wrap items-center gap-1.5">
-          {r.handled
-            ? <Button size="sm" onClick={() => runAction(async () => { onPatch({ handled: false }); return setHandled(r.id, false); })}><RotateCcw size={14} />Reopen</Button>
-            : <Button size="sm" onClick={() => runAction(async () => { onPatch({ handled: true, follow_up_at: null }); return setHandled(r.id, true); })}><Check size={14} />Done</Button>}
-        </div>
-      </div>
 
-      {r.kind === "reply" && (
-        <div className="flex flex-wrap items-center gap-1.5 px-5 py-2.5 border-b border-line bg-panel-2/40 text-[12.5px]">
-          <span className="text-muted mr-1">Lead is</span>
-          {(["interested", "neutral", "not_interested"] as const).map((s) => (
-            <button key={s} onClick={() => startQuiet(async () => { onPatch({ sentiment: s }); await markReply(r.id, { sentiment: s }); })}
-              className={cx("h-7 px-2.5 rounded-full border capitalize transition-colors",
-                r.sentiment === s
-                  ? s === "interested" ? "bg-good-soft text-good border-good/30" : s === "not_interested" ? "bg-bad-soft text-bad border-bad/30" : "bg-panel text-ink border-line"
-                  : "border-line text-muted hover:text-ink")}>
-              {s.replace("_", " ")}
-            </button>
-          ))}
-          <span className="mx-1 h-4 w-px bg-line" />
-          <AlarmClock size={14} className="text-muted" />
-          <span className="text-muted">Remind me</span>
-          {[["Tomorrow", 1], ["In 3 days", 3], ["Next week", 7]].map(([l, d]) => (
-            <button key={l} onClick={() => remind(inDays(d as number))} className="h-7 px-2.5 rounded-full border border-line text-muted hover:text-ink">{l}</button>
-          ))}
-          {pickDate
-            ? <input type="date" autoFocus className="h-7 rounded-md border border-line bg-panel px-2 text-[12.5px]"
-                onChange={(e) => { if (e.target.value) { remind(new Date(`${e.target.value}T09:00:00`).toISOString()); setPickDate(false); } }} />
-            : <button onClick={() => setPickDate(true)} className="h-7 px-2.5 rounded-full border border-line text-muted hover:text-ink">Pick date</button>}
-          {r.follow_up_at && <button onClick={() => remind(null)} className="text-faint hover:text-ink underline">clear ({followUpLabel(r.follow_up_at)})</button>}
-        </div>
-      )}
-
-      <div className="px-5 py-4 grid gap-3 max-h-[46vh] overflow-y-auto">
-        {thread === null ? <div className="flex items-center gap-2 text-[13px] text-muted"><Spinner />Loading conversation…</div>
-          : thread.length === 0 ? <ThreadBubble item={{ id: r.id, direction: "in", at: r.received_at, subject: r.subject, body: r.body || r.snippet, who: r.from_name || r.from_email, label: "Reply" }} />
-          : thread.map((t) => <ThreadBubble key={t.id} item={t} highlight={t.id === r.id} />)}
-      </div>
-
-      {canReply && (
-        <div className="border-t border-line px-5 py-4 grid gap-2.5 bg-panel-2/30">
+        <div className="grid gap-2">
           <div className="flex items-center justify-between gap-2">
-            <div className="text-[13px] font-medium flex items-center gap-1.5"><CornerUpLeft size={14} />Reply to {r.from_name?.split(" ")[0] || r.from_email}</div>
-            <Button size="sm" onClick={suggest} disabled={suggesting}>{suggesting ? <Spinner /> : <Sparkles size={14} />}{draft ? "Suggest again" : "Suggest a reply"}</Button>
+            <button type="button" onClick={() => setShowFilters((s) => !s)} aria-expanded={showFilters}
+              className="sm:pointer-events-none inline-flex items-center gap-1.5 text-[12px] font-medium text-muted uppercase tracking-[0.08em]">
+              <SlidersHorizontal size={13} />Filters{filtersOn ? <Badge tone="accent">{filtersOn}</Badge> : null}
+            </button>
+            <span className="flex items-center gap-2">
+              {pending && <Spinner className="text-muted hidden xl:inline-block" />}
+              {filtersOn > 0 && <button type="button" onClick={() => go({ label: "", campaign: "", account: "" })} className="text-[12px] text-muted hover:text-ink underline">Clear</button>}
+            </span>
           </div>
-          <Textarea rows={6} value={draft} onChange={(e) => setDraft(e.target.value)}
-            placeholder="Write your reply… It goes from the same mailbox, in the same email thread, with your signature added." />
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <span className="text-[12px] text-faint">A copy is saved to the mailbox&apos;s Sent folder, so you&apos;ll see it in your email app too.</span>
-            <Button variant="primary" disabled={sending || !draft.trim()}
-              onClick={() => runSend(() => replyTo(r.id, draft), () => { setDraft(""); onPatch({ handled: true, answered_at: new Date().toISOString(), follow_up_at: null }); getThread(r.id).then(setThread); })}>
-              {sending ? <Spinner /> : <Send size={14} />}Send reply
-            </Button>
+          <div className={cx("grid gap-2 sm:grid-cols-3 xl:grid-cols-1", !showFilters && "max-sm:hidden")}>
+            <Select aria-label="Label" value={shown.label} onChange={(e) => go({ label: e.target.value })} className="h-8 text-[13px]">
+              <option value="">Any label</option>
+              {REPLY_LABELS.map((l) => {
+                const n = counts.labels?.[l.key];
+                return <option key={l.key} value={l.key}>{l.label}{n ? ` (${fmtNum(n)})` : ""}</option>;
+              })}
+            </Select>
+            <Select aria-label="Campaign" value={shown.campaign} onChange={(e) => go({ campaign: e.target.value })} className="h-8 text-[13px]">
+              <option value="">All campaigns</option>
+              {options.campaigns.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </Select>
+            <Select aria-label="Email account" value={shown.account} onChange={(e) => go({ account: e.target.value })} className="h-8 text-[13px]">
+              <option value="">All email accounts</option>
+              {options.mailboxes.map((m) => <option key={m.id} value={m.id}>{m.email}</option>)}
+            </Select>
           </div>
         </div>
-      )}
-
-      <details className="border-t border-line px-5 py-3 text-[13px]" open={Boolean(r.note)}>
-        <summary className="cursor-pointer select-none text-muted inline-flex items-center gap-1.5"><StickyNote size={14} />Private note</summary>
-        <Textarea rows={2} className="mt-2" value={note} placeholder="e.g. Wants pricing for 3 plants. Call after Diwali."
-          onChange={(e) => setNote(e.target.value)} onBlur={() => note !== (r.note ?? "") && startQuiet(async () => { await saveNote(r.id, note); onPatch({ note }); })} />
-      </details>
-    </Card>
-  );
-}
-
-function ThreadBubble({ item: t, highlight }: { item: ThreadItem; highlight?: boolean }) {
-  const out = t.direction === "out";
-  return (
-    <div className={cx("rounded-xl border px-4 py-3 text-[13.5px]", out ? "border-line bg-panel-2/50 ml-6" : "border-line bg-panel mr-6", highlight && "ring-2 ring-accent/20 border-accent/40")}>
-      <div className="flex flex-wrap items-center gap-2 text-[12px] text-muted mb-1.5">
-        <span className="font-medium text-ink">{out ? "You" : t.who}</span>
-        <Badge tone={out ? "neutral" : t.label === "Reply" ? "accent" : "neutral"}>{t.label}</Badge>
-        <span className="ml-auto tabular-nums">{new Date(t.at).toLocaleString(undefined, { day: "numeric", month: "short", hour: "numeric", minute: "2-digit" })}</span>
       </div>
-      {t.subject && <div className="font-medium text-[13px] mb-1">{t.subject}</div>}
-      <pre className="whitespace-pre-wrap break-words font-sans leading-relaxed">{t.body}</pre>
+
+      {/* Conversation list */}
+      <Card className={cx("overflow-hidden min-w-0 md:sticky md:top-6 md:max-h-[calc(100dvh-150px)] flex flex-col", selected && "max-md:hidden",
+        !rows.length && "md:col-span-2")}>
+        <div className="flex items-center gap-1.5 p-2 border-b border-line">
+          <label className="relative flex-1 min-w-0">
+            <span className="sr-only">Search conversations</span>
+            <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-faint pointer-events-none" />
+            <input ref={searchBox} type="search" value={search} onChange={(e) => onSearch(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Escape") { e.currentTarget.blur(); } }}
+              placeholder="Search name, email or subject" className={cx(inputClass, "h-8 pl-8 text-[13px]")} />
+          </label>
+          <ShortcutHelp shortcuts={SHORTCUTS} showButton />
+        </div>
+
+        {noDetection.length > 0 && (
+          <div className="px-3 py-2 border-b border-line bg-warn-soft text-[12.5px] grid gap-0.5">
+            {noDetection.map((m) => (
+              <div key={m.id} className="flex items-start gap-1.5">
+                <TriangleAlert size={13} className="text-warn mt-0.5 shrink-0" />
+                <span className="min-w-0 break-words">Replies can&apos;t be read for {m.email}. <Link href="/mailboxes" className="underline font-medium">Fix connection</Link></span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className={cx("overflow-y-auto min-h-0 transition-opacity", pending && "opacity-60 pointer-events-none")} aria-busy={pending || undefined}>
+          {rows.length === 0 ? (
+            options.mailboxes.length === 0 ? (
+              <Empty icon={<Mail size={28} />} title="No email account yet" action={<ButtonLink variant="secondary" href="/mailboxes?connect=1">Connect an email account</ButtonLink>}>
+                Connect an email account to receive replies.
+              </Empty>
+            ) : searching ? (
+              <Empty icon={<Search size={28} />} title="No conversations match"
+                action={<Button onClick={() => { setSearch(""); go({ q: "", label: "", campaign: "", account: "" }); }}>Clear search and filters</Button>}>
+                Try another search, or look in All.
+              </Empty>
+            ) : (
+              <Empty icon={<Inbox size={28} />} title={EMPTY[filter.f].title}
+                secondary={filter.f === "todo" && counts.next_reminder ? <>Next reminder: {fmtDay(counts.next_reminder)}</> : undefined}>
+                {EMPTY[filter.f].body}
+              </Empty>
+            )
+          ) : (
+            <>
+              {rows.map((r) => <Row key={r.id} row={r} active={selected?.id === r.id} now={now} onOpen={() => open(r.id)} />)}
+              {hasMore && (
+                <div className="p-2">
+                  <Button size="sm" variant="ghost" className="w-full" disabled={loadingMore} onClick={loadMore}>
+                    {loadingMore && <Spinner />}Load more
+                  </Button>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </Card>
+
+      {/* Conversation (full width on phones, with Back) */}
+      {rows.length > 0 && (
+        <div className={cx("min-w-0", !selected && "max-md:hidden")}>
+          {selected
+            ? <Conversation key={selected.id} row={selected} onChange={change(selected.id)} onBack={() => open(null)} />
+            : <Card className="hidden md:block"><Empty icon={<CornerUpLeft size={28} />} title="Pick a conversation">Press J and K to move through the list.</Empty></Card>}
+        </div>
+      )}
     </div>
   );
 }
 
-export function NewEmailButton({ mailboxes }: { mailboxes: Pick<Mailbox, "id" | "email" | "status">[] }) {
-  const [open, setOpen] = useState(false);
-  const [f, setF] = useState({ mailboxId: mailboxes[0]?.id ?? "", to: "", firstName: "", company: "", subject: "", body: "" });
-  const [pending, run] = useAction();
-  const set = (k: keyof typeof f, v: string) => setF((p) => ({ ...p, [k]: v }));
-  if (!mailboxes.length) return null;
+function Row({ row: r, active, now, onOpen }: { row: InboxRow; active: boolean; now: number; onOpen: () => void }) {
+  const lbl = replyLabel(r.sentiment);
+  const who = r.leads?.company || r.from_email.split("@")[1] || "";
+  const chip = r.follow_up_at && !r.handled ? reminderChip(r.follow_up_at, now) : null;
   return (
-    <>
-      <Button variant="primary" onClick={() => setOpen(true)}><PenLine size={15} />New email</Button>
-      {open && (
-        <Dialog open wide onClose={() => setOpen(false)} title="Write an email" description="A one-off email from one of your mailboxes. The person is saved to Leads so their reply shows up here."
-          footer={<Button variant="primary" disabled={pending || !f.to || !f.subject || !f.body}
-            onClick={() => run(() => sendOneOff(f), () => { setOpen(false); setF((p) => ({ ...p, to: "", firstName: "", company: "", subject: "", body: "" })); })}>
-            {pending ? <Spinner /> : <Send size={14} />}Send</Button>}>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <Field label="From">
-              <Select value={f.mailboxId} onChange={(e) => set("mailboxId", e.target.value)}>
-                {mailboxes.map((m) => <option key={m.id} value={m.id}>{m.email}</option>)}
-              </Select>
-            </Field>
-            <Field label="To"><Input type="email" value={f.to} autoFocus placeholder="priya@acme.com" onChange={(e) => set("to", e.target.value)} /></Field>
-            <Field label="Their first name (optional)"><Input value={f.firstName} onChange={(e) => set("firstName", e.target.value)} /></Field>
-            <Field label="Company (optional)"><Input value={f.company} onChange={(e) => set("company", e.target.value)} /></Field>
-            <Field label="Subject" className="sm:col-span-2"><Input value={f.subject} onChange={(e) => set("subject", e.target.value)} /></Field>
-            <Field label="Message" hint="Plain text. Your mailbox signature is added automatically." className="sm:col-span-2">
-              <Textarea rows={9} value={f.body} onChange={(e) => set("body", e.target.value)} />
-            </Field>
-          </div>
-        </Dialog>
+    <button id={`reply-${r.id}`} type="button" onClick={onOpen} aria-current={active || undefined}
+      className={cx("w-full text-left px-3.5 py-3 border-b border-line last:border-0 transition-colors outline-none focus-visible:bg-panel-2",
+        active ? "bg-accent-soft/60" : "hover:bg-panel-2/60")}>
+      <div className="flex items-center gap-2">
+        {!r.is_read && <span className="size-1.5 rounded-full bg-accent shrink-0" aria-label="Unread" />}
+        <span className={cx("truncate flex-1", !r.is_read && "font-semibold")}>{r.from_name || r.from_email}</span>
+        <RelativeTime iso={r.received_at} className="text-[11.5px] text-faint tabular-nums shrink-0" />
+      </div>
+      {who && <div className="text-[12px] text-faint truncate">{who}</div>}
+      <div className={cx("text-[12.5px] truncate mt-0.5", r.is_read ? "text-muted" : "text-ink")}>{r.snippet || r.subject}</div>
+      {(lbl || r.kind !== "reply" || chip || r.answered_at || r.campaigns?.name) && (
+        <div className="flex flex-wrap items-center gap-1 mt-1.5">
+          {r.kind !== "reply" && <Badge tone={r.kind === "bounce" ? "bad" : "neutral"}>{REPLY_KIND_LABEL[r.kind]}</Badge>}
+          {lbl && <Badge tone={lbl.tone}>{lbl.label}</Badge>}
+          {chip && <Badge tone={chip.tone}><AlarmClock size={11} />Reminder · {chip.text}</Badge>}
+          {r.answered_at && <span title="You replied" className="text-good inline-flex"><CornerUpLeft size={12} /></span>}
+          {r.campaigns?.name && <span className="text-[11.5px] text-faint truncate max-w-full">{r.campaigns.name}</span>}
+        </div>
       )}
-    </>
+    </button>
   );
 }
-

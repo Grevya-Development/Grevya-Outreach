@@ -7,6 +7,7 @@
 //  - Mailboxes auto-pause when bounces spike; leads at the same company and leads contacted by
 //    another campaign recently are deferred.
 import { randomUUID } from "node:crypto";
+import { isSendingPaused } from "./app-state";
 import { composeEmail, NotPreparedError } from "./compose";
 import { generateLine, groqLimits, RateLimitError } from "./groq";
 import { syncMailbox } from "./imap";
@@ -74,6 +75,18 @@ export async function tick(opts: { syncInbox?: boolean; prepareMs?: number } = {
     }
   }
 
+  // Paused by the user (the switch in the sidebar): replies are still picked up above and AI
+  // writing carries on, but nothing is sent.
+  if (await isSendingPaused()) {
+    if (opts.prepareMs) result.prep = await prepareBatch(opts.prepareMs);
+    result.skipped["all"] = "paused by you";
+    await heartbeat({
+      last_tick: new Date().toISOString(), paused: true, sent: 0, errors: result.errors.slice(0, 5), skipped: result.skipped,
+      ...(result.prep ? { last_prepare: new Date().toISOString(), prep_rate_limited_for: result.prep.rateLimitedFor } : {}),
+    });
+    return result;
+  }
+
   await Promise.all(
     mailboxes.map(async (mb) => {
       try {
@@ -111,17 +124,25 @@ export async function tick(opts: { syncInbox?: boolean; prepareMs?: number } = {
   await completeFinishedCampaigns();
   const groq = groqLimits();
   await heartbeat({
-    last_tick: new Date().toISOString(), sent: result.sent, errors: result.errors.slice(0, 5), skipped: result.skipped,
+    last_tick: new Date().toISOString(), paused: false, sent: result.sent, errors: result.errors.slice(0, 5), skipped: result.skipped,
     ...(Object.keys(groq).length ? { groq } : {}),
     ...(result.prep ? { last_prepare: new Date().toISOString(), prep_rate_limited_for: result.prep.rateLimitedFor } : {}),
   });
   return result;
 }
 
-export async function heartbeat(value: Record<string, unknown>) {
-  const supa = db();
-  const { data } = await supa.from("app_state").select("value").eq("key", "engine").maybeSingle();
-  await supa.from("app_state").upsert({ key: "engine", value: { ...(data?.value ?? {}), ...value }, updated_at: new Date().toISOString() });
+// The send, prepare and verify loops all write the same row (read, merge, write). Running those
+// one after another stops one loop from overwriting another's fields with stale values.
+let beat: Promise<unknown> = Promise.resolve();
+
+export function heartbeat(value: Record<string, unknown>): Promise<void> {
+  const write = beat.then(async () => {
+    const supa = db();
+    const { data } = await supa.from("app_state").select("value").eq("key", "engine").maybeSingle();
+    await supa.from("app_state").upsert({ key: "engine", value: { ...(data?.value ?? {}), ...value }, updated_at: new Date().toISOString() });
+  });
+  beat = write.catch(() => {});
+  return write;
 }
 
 /** Gives back an unused slot — only if no other engine has reserved a newer one since. */
@@ -401,12 +422,11 @@ async function completeFinishedCampaigns() {
   const supa = db();
   const active = must(await supa.from("campaigns").select("id").eq("status", "active")) as { id: string }[];
   for (const c of active) {
-    const { count } = await supa
-      .from("campaign_leads")
-      .select("id", { count: "exact", head: true })
-      .eq("campaign_id", c.id)
-      .in("status", ["queued", "in_progress"]);
-    const { count: total } = await supa.from("campaign_leads").select("id", { count: "exact", head: true }).eq("campaign_id", c.id);
-    if (count === 0 && (total ?? 0) > 0) await supa.from("campaigns").update({ status: "completed" }).eq("id", c.id);
+    // Done when it has leads and none of them is still waiting to send (two one-row reads).
+    const { data: remaining, error } = await supa.from("campaign_leads").select("status")
+      .eq("campaign_id", c.id).in("status", ["queued", "in_progress"]).limit(1);
+    if (error || remaining.length) continue;
+    const { data: enrolled } = await supa.from("campaign_leads").select("id").eq("campaign_id", c.id).limit(1);
+    if (enrolled?.length) await supa.from("campaigns").update({ status: "completed" }).eq("id", c.id);
   }
 }

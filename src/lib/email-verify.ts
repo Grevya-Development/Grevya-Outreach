@@ -7,6 +7,8 @@
 import { randomBytes } from "node:crypto";
 import { resolveMx, resolve4 } from "node:dns/promises";
 import net from "node:net";
+import { VERIFIER_KEY } from "./app-state";
+import { fmtDate } from "./format";
 import { db } from "./supabase";
 
 export type VerifyStatus = "valid" | "invalid" | "risky" | "unknown";
@@ -82,39 +84,97 @@ export function providerFromMxHosts(mx: string[]): string | null {
   return mx[0] ?? null;
 }
 
-const mxCache = new Map<string, Promise<string[]>>();
-export function mxHosts(domain: string): Promise<string[]> {
+/** The domain couldn't be looked up right now (network down, resolver timeout) — says nothing about the address. */
+export class DnsUnavailableError extends Error {}
+
+// Answers that really mean "this domain has no such record"; anything else is a lookup failure.
+const DNS_NO_RECORD = new Set(["ENOTFOUND", "ENODATA", "ENONAME", "ENXDOMAIN", "NXDOMAIN"]);
+const dnsCode = (err: unknown) => String((err as { code?: string } | null)?.code ?? "");
+
+type MxLookup = { hosts: string[]; failed: boolean };
+const mxCache = new Map<string, Promise<MxLookup>>();
+function lookupMx(domain: string): Promise<MxLookup> {
   let p = mxCache.get(domain);
   if (!p) {
     p = resolveMx(domain)
-      .then((r) => r.sort((a, b) => a.priority - b.priority).map((x) => x.exchange).filter((h) => h && h !== "."))
-      .catch(async () => {
+      .then((r) => ({ hosts: r.sort((a, b) => a.priority - b.priority).map((x) => x.exchange).filter((h) => h && h !== "."), failed: false }))
+      .catch(async (mxErr) => {
         // RFC 5321: no MX but an A record → mail goes to the A host.
-        try { return (await resolve4(domain)).length ? [domain] : []; } catch { return []; }
+        try {
+          return { hosts: (await resolve4(domain)).length ? [domain] : [], failed: false };
+        } catch (aErr) {
+          return { hosts: [], failed: !DNS_NO_RECORD.has(dnsCode(mxErr)) || !DNS_NO_RECORD.has(dnsCode(aErr)) };
+        }
       });
     mxCache.set(domain, p);
+    // A failed lookup is forgotten right away so the next check asks again.
+    p.then((r) => { if (r.failed) mxCache.delete(domain); });
     setTimeout(() => mxCache.delete(domain), 10 * 60_000).unref?.();
   }
   return p;
 }
 
+export async function mxHosts(domain: string): Promise<string[]> {
+  return (await lookupMx(domain)).hosts;
+}
+
 /* ───────────── SMTP mailbox probe ───────────── */
 
-let port25: { ok: boolean; at: number } | null = null;
+// Whether this network can reach mail servers on port 25. The engine re-checks it every 30 min
+// (refreshSmtpCapability) and stores it in app_state, so pages and checks rarely open a socket.
+const MEMORY_TTL_MS = 10 * 60_000;
+const STORED_TTL_MS = 60 * 60_000;
+type Port25 = { ok: boolean; at: number };
+const cap = globalThis as { __port25?: Port25; __port25Check?: Promise<boolean> }; // shared across bundles and hot reloads
 
-/** Can this machine talk to mail servers on port 25? (Most home/office ISPs and clouds block it.) */
-export async function canProbeSmtp(): Promise<boolean> {
-  if (process.env.VERIFIER_SMTP === "off") return false;
-  if (port25 && Date.now() - port25.at < 10 * 60_000) return port25.ok;
-  const ok = await new Promise<boolean>((resolve) => {
+function probePort25(): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
     const s = net.connect({ host: "gmail-smtp-in.l.google.com", port: 25 });
     const done = (v: boolean) => { s.destroy(); resolve(v); };
     s.setTimeout(6000, () => done(false));
     s.once("data", (d) => done(d.toString().startsWith("220")));
     s.once("error", () => done(false));
   });
-  port25 = { ok, at: Date.now() };
+}
+
+/** Probes port 25 now (ignoring every cache) and stores the answer in app_state.verifier. */
+export async function refreshSmtpCapability(): Promise<boolean> {
+  const ok = process.env.VERIFIER_SMTP === "off" ? false : await probePort25();
+  cap.__port25 = { ok, at: Date.now() };
+  try {
+    const now = new Date().toISOString();
+    await db().from("app_state").upsert({ key: VERIFIER_KEY, value: { smtp: ok, checked_at: now }, updated_at: now });
+  } catch { /* the in-memory answer still holds */ }
   return ok;
+}
+
+/** The last stored port-25 answer. Only reads app_state, never opens a socket (safe for pages). */
+export async function getCachedSmtpCapability(): Promise<{ ok: boolean; checkedAt: string } | null> {
+  try {
+    const { data } = await db().from("app_state").select("value").eq("key", VERIFIER_KEY).maybeSingle();
+    const v = data?.value as { smtp?: unknown; checked_at?: unknown } | undefined;
+    if (!v || typeof v.smtp !== "boolean") return null;
+    return { ok: v.smtp && process.env.VERIFIER_SMTP !== "off", checkedAt: typeof v.checked_at === "string" ? v.checked_at : "" };
+  } catch {
+    return null;
+  }
+}
+
+/** Can this machine talk to mail servers on port 25? (Most home/office ISPs and clouds block it.) */
+export async function canProbeSmtp(): Promise<boolean> {
+  if (process.env.VERIFIER_SMTP === "off") return false;
+  const mem = cap.__port25;
+  if (mem && Date.now() - mem.at < MEMORY_TTL_MS) return mem.ok;
+  // One lookup at a time: parallel checks share it instead of each probing.
+  cap.__port25Check ??= (async () => {
+    const stored = await getCachedSmtpCapability();
+    if (stored && Date.now() - new Date(stored.checkedAt).getTime() < STORED_TTL_MS) {
+      cap.__port25 = { ok: stored.ok, at: Date.now() };
+      return stored.ok;
+    }
+    return refreshSmtpCapability();
+  })().finally(() => { cap.__port25Check = undefined; });
+  return cap.__port25Check;
 }
 
 interface SmtpReply { code: number; text: string }
@@ -183,6 +243,8 @@ const result = (email: string, partial: Partial<VerifyResult> & Pick<VerifyResul
 export interface VerifyOptions {
   useSmtp?: boolean;   // default: when port 25 is reachable
   useCache?: boolean;  // default true (30 days)
+  /** Throw DnsUnavailableError when the domain can't be looked up right now, instead of answering "unknown". */
+  strictDns?: boolean;
 }
 
 export async function verifyAddress(raw: string, opts: VerifyOptions = {}): Promise<VerifyResult> {
@@ -206,8 +268,13 @@ export async function verifyAddress(raw: string, opts: VerifyOptions = {}): Prom
     if (cached?.v === CACHE_VERSION && Date.now() - new Date(data!.checked_at).getTime() < 30 * 86_400_000) return { ...cached, source: "cache" };
   }
 
-  const mx = await mxHosts(domain);
+  const { hosts: mx, failed: dnsFailed } = await lookupMx(domain);
   const provider = providerFromMxHosts(mx);
+  if (!mx.length && dnsFailed) {
+    // A network hiccup must never brand an address invalid. Not cached: the next check retries.
+    if (opts.strictDns) throw new DnsUnavailableError(`Couldn't look up ${domain} right now`);
+    return result(email, { status: "unknown", score: 50, reason: `Couldn't look up ${domain} right now — check again in a few minutes`, suggestion }, checks, null, "dns");
+  }
   if (!mx.length) {
     return save(result(email, { status: "invalid", score: 2, reason: `${domain} has no mail server — emails would bounce`, suggestion }, checks, null, "dns"));
   }
@@ -258,7 +325,7 @@ export async function verifyAddress(raw: string, opts: VerifyOptions = {}): Prom
   // Domain-level only: say precisely why the mailbox couldn't be confirmed.
   const who = provider && !provider.includes(".") ? provider : `${domain}'s mail server`;
   const reason = !smtpOk
-    ? "The domain accepts email, but mailbox checks need outgoing port 25, which this network blocks."
+    ? "The domain accepts email, but this network can't ask its mail server whether the mailbox exists."
     : refused
       ? `${who} refuses verification checks from your current internet connection (it blocks home/office IPs), so this mailbox can't be confirmed from here. It will be checked automatically when the app runs on a server (e.g. a VPS).`
       : `${who} wouldn't say whether this mailbox exists (some servers hide that on purpose).`;
@@ -280,7 +347,7 @@ async function knownEvidence(email: string): Promise<string | null> {
   if (mailbox.data?.length) return "This is one of your connected mailboxes";
   if (reply.data?.length) return "This person has emailed you from this address";
   if (sent.data?.length && !bounced.data?.length) {
-    return `You emailed this address on ${new Date(sent.data[0].sent_at).toLocaleDateString("en-IN", { day: "numeric", month: "short" })} and it didn't bounce`;
+    return `You emailed this address on ${fmtDate(sent.data[0].sent_at)} and it didn't bounce`;
   }
   return null;
 }

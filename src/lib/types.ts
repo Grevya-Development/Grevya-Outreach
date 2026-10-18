@@ -37,7 +37,7 @@ export interface Mailbox {
 /** Mailbox without the encrypted password, safe to hand to client components. */
 export type PublicMailbox = Omit<Mailbox, "password_enc">;
 
-export type LeadStatus = "active" | "unsubscribed" | "bounced" | "invalid";
+export type LeadStatus = "active" | "unsubscribed" | "bounced" | "invalid" | "blocked";
 
 export interface Lead {
   id: string;
@@ -75,6 +75,8 @@ export interface Campaign {
   mode: "template" | "ai";
   min_fit_score: number;
   require_approval: boolean;
+  /** Set when the sequence is saved; AI writing waits for it (migration 0004, absent before). */
+  sequence_confirmed_at?: string | null;
   created_at: string;
 }
 
@@ -107,6 +109,8 @@ export interface CampaignLead {
     angle?: string;
     best_service?: string;
     fit_score?: number;
+    /** The user changed the AI's draft by hand. */
+    edited?: boolean;
   } | null;
   last_message_id: string | null;
   last_subject: string | null;
@@ -133,6 +137,9 @@ export interface CampaignStats {
   remaining: number;
 }
 
+/** Labels you can put on a reply (`replies.sentiment`); 'neutral'/null mean no label. */
+export type ReplyLabel = "interested" | "meeting_booked" | "out_of_office" | "wrong_person" | "not_interested" | "closed";
+
 export interface Reply {
   id: string;
   mailbox_id: string | null;
@@ -144,7 +151,7 @@ export interface Reply {
   snippet: string;
   body: string;
   kind: "reply" | "auto_reply" | "bounce";
-  sentiment: "interested" | "not_interested" | "neutral" | null;
+  sentiment: ReplyLabel | "neutral" | null;
   is_read: boolean;
   received_at: string;
   message_id: string | null;

@@ -9,6 +9,10 @@ const nextConfig: NextConfig = {
     // switching); any save calls refresh(), so you never see stale data after an action.
     staleTimes: { dynamic: 30, static: 300 },
   },
+  // The E-mail Verifier now lives under Leads → Find & verify.
+  async redirects() {
+    return [{ source: "/verifier", destination: "/leads/find", permanent: false }];
+  },
   turbopack: {
     root: __dirname,
     rules: {

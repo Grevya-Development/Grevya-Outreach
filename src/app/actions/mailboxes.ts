@@ -1,13 +1,13 @@
 "use server";
 
-import { resolveMx } from "node:dns/promises";
-import { refresh } from "next/cache";
+import { refresh, updateTag } from "next/cache";
 import type { ActionResult } from "@/components/client";
+import { getSendingSchedule } from "@/lib/app-state";
 import { encrypt } from "@/lib/crypto";
 import { checkDomain, type HealthCheck } from "@/lib/domain-health";
 import { imapClient } from "@/lib/imap";
 import { transportFor } from "@/lib/mailer";
-import { explainError, providerFromMx, type CheckResult, type ProviderKey } from "@/lib/providers";
+import { explainError, type CheckResult } from "@/lib/providers";
 import { MAILBOX_HARD_CAP } from "@/lib/schedule";
 import { db, must } from "@/lib/supabase";
 import type { Mailbox } from "@/lib/types";
@@ -36,6 +36,8 @@ export interface MailboxInput {
   send_days: number[];
   signature: string;
   save_to_sent?: boolean;
+  /** New account only: the user changed the sending hours. Otherwise Settings → Sending's schedule is used. */
+  custom_hours?: boolean;
 }
 
 function clean(input: MailboxInput) {
@@ -87,11 +89,15 @@ export async function saveMailbox(input: MailboxInput): Promise<ActionResult> {
     if (error) return { ok: false, error: error.message };
   } else {
     if (!input.password) return { ok: false, error: "Password is required" };
-    const { error } = await supa.from("mailboxes").insert({ ...row, password_enc: encrypt(input.password) });
-    if (error) return { ok: false, error: error.message.includes("duplicate") ? "This mailbox already exists" : error.message };
+    // New accounts follow the global schedule (Settings → Sending) unless the user set their own hours.
+    const hours = input.custom_hours ? {} : await getSendingSchedule();
+    const { data, error } = await supa.from("mailboxes").insert({ ...row, ...hours, password_enc: encrypt(input.password) }).select("id").single();
+    if (error) return { ok: false, error: error.message.includes("duplicate") ? "This email account is already connected" : error.message };
+    refresh();
+    return { ok: true, message: `${row.email} connected`, action: { label: "Send test email", href: `/mailboxes?test=${(data as { id: string }).id}` } };
   }
   refresh();
-  return { ok: true, message: "Mailbox saved" };
+  return { ok: true, message: "Email account saved" };
 }
 
 export interface ConnectionTest {
@@ -105,7 +111,7 @@ export async function testMailbox(input: MailboxInput, providerLabel?: string): 
   let password_enc: string;
   if (input.password) password_enc = encrypt(input.password);
   else if (input.id) password_enc = (must(await db().from("mailboxes").select("password_enc").eq("id", input.id).single()) as { password_enc: string }).password_enc;
-  else return { smtp: { ok: false, message: "Enter the mailbox password first." }, imap: null };
+  else return { smtp: { ok: false, message: "Enter the password first." }, imap: null };
   if (!input.email.includes("@")) return { smtp: { ok: false, message: "Enter the email address first." }, imap: null };
 
   const row = { ...clean(input), password_enc };
@@ -137,19 +143,6 @@ export async function testMailbox(input: MailboxInput, providerLabel?: string): 
   return { smtp, imap };
 }
 
-/** Guesses the mail provider from the domain's MX records (e.g. grevya.com → GoDaddy). */
-export async function detectProvider(email: string): Promise<ProviderKey | null> {
-  await requireAuth();
-  const domain = email.split("@")[1]?.trim().toLowerCase();
-  if (!domain || !domain.includes(".")) return null;
-  try {
-    const mx = await resolveMx(domain);
-    return providerFromMx(mx.map((m) => m.exchange));
-  } catch {
-    return null;
-  }
-}
-
 export async function sendTestEmail(id: string, to: string): Promise<ActionResult> {
   await requireAuth();
   const mb = must(await db().from("mailboxes").select("*").eq("id", id).single()) as Mailbox;
@@ -172,7 +165,7 @@ export async function setMailboxStatus(id: string, status: "active" | "paused"):
   await requireAuth();
   must(await db().from("mailboxes").update({ status, last_error: status === "active" ? null : undefined }).eq("id", id));
   refresh();
-  return { ok: true, message: status === "active" ? "Mailbox resumed" : "Mailbox paused" };
+  return { ok: true, message: status === "active" ? "Email account resumed" : "Email account paused" };
 }
 
 export async function restartWarmup(id: string): Promise<ActionResult> {
@@ -190,13 +183,19 @@ export async function deleteMailbox(id: string): Promise<ActionResult> {
     .eq("mailbox_id", id).in("status", ["queued", "in_progress"]));
   must(await db().from("mailboxes").delete().eq("id", id));
   refresh();
-  return { ok: true, message: "Mailbox removed" };
+  return { ok: true, message: "Email account removed" };
 }
 
-/** SPF / DKIM / DMARC / MX check for a mailbox's domain. */
-export async function checkMailboxDomain(email: string, smtpHost: string, selector?: string): Promise<HealthCheck[]> {
+/**
+ * "Re-check DNS": expires the cached SPF/DKIM/DMARC/MX result for the domain (the page re-renders it
+ * on refresh). With a DKIM selector, also checks right away and returns the result, since the
+ * cached check only knows the common selectors.
+ */
+export async function recheckDomain(emailOrDomain: string, smtpHost: string, selector?: string): Promise<HealthCheck[] | null> {
   await requireAuth();
-  const domain = email.split("@")[1];
-  if (!domain) return [];
-  return checkDomain(domain, smtpHost, selector?.trim() || undefined);
+  const domain = (emailOrDomain.includes("@") ? emailOrDomain.split("@")[1] : emailOrDomain).trim().toLowerCase();
+  if (!domain) return null;
+  updateTag(`dns:${domain}`);
+  const sel = selector?.trim();
+  return sel ? checkDomain(domain, smtpHost, sel) : null;
 }

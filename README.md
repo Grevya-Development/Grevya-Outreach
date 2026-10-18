@@ -15,7 +15,7 @@ Self-hosted cold email: sends personalised sequences from your own mailboxes (in
 - **Company profile:** in Settings → Company profile, use "Import from website" to draft it from grevya.com. The AI only quotes the results you list there.
 - **Add people however you like:** type one person in, paste a list (plain emails, `Name <email>`, or spreadsheet rows), or import a CSV — straight into a campaign if you want.
 - **Follow-up made easy (Inbox):** "Needs reply" and "Follow-ups due" queues, the full conversation thread, reply in the same thread from the app with an AI-suggested draft, one-click reminders (tomorrow / 3 days / next week), private notes, and a "New email" button for one-off messages. Everything sent is copied to the mailbox's Sent folder so your normal email app shows the whole conversation.
-- **E-mail Verifier:** paste any list to check each address:
+- **Email checks:** every new lead's address is checked automatically in the background while the app runs (newest first, up to 25 at a time). Invalid addresses are marked and never emailed. To check a list by hand or find someone's email, use Leads → Find & verify:
   - **Checks:** syntax and typos (gmial.com → gmail.com), mail server, disposable and role addresses, and whether the mailbox really exists (asked of the company's mail server over SMTP; nothing is sent). Accept-all domains are detected.
   - **Find someone's email:** from first name, last name and company domain, it builds the likely formats and learns the company's pattern from your existing leads and its website, then confirms with the mail server.
   - **Saving:** results go straight to Leads or a campaign.
@@ -42,7 +42,7 @@ Self-hosted cold email: sends personalised sequences from your own mailboxes (in
 - **800/day needs at least 2 mailboxes at 400.** Use a second domain (e.g. `getgrevya.com`) so a reputation hit can't affect info@grevya.com.
 - **Warm-up takes time.** At the default 20 → +10/day, each mailbox reaches 400/day in about 5 weeks. Rushing this is the most common way to land in spam.
 - **Turn on DKIM** (Mailboxes → deliverability panel). Without it Gmail and Outlook distrust you.
-- **Keep bounces under 2%:** verify lists (Leads → Verify new). The engine also auto-pauses bad mailboxes.
+- **Keep bounces under 2%:** new leads are checked automatically before they're emailed. The engine also auto-pauses bad mailboxes.
 - **Groq:** the free plan allows ~1,000 requests and 200K tokens per model per day. A researched lead uses ~5,500 tokens, so free covers roughly 150–250 researched leads a day (the engine rotates across 3 models). For 800/day, enable Groq's pay-as-you-go plan — about $1/day.
 - **No tool can guarantee inbox placement.** Relevance (research), low volume per mailbox, authentication and clean lists are what move it.
 
@@ -61,26 +61,24 @@ Requires **Node 20+**.
    npm run db:setup
    ```
    Or paste each file in `supabase/migrations/` (0001, 0002, 0003 …) into the Supabase SQL editor, in order. The app shows a banner — and the engine refuses to send — until the database is up to date.
-4. **Run the dashboard:**
+4. **Run the app:**
    ```bash
    npm run dev
    ```
-5. **Run the sending engine** in a second terminal:
-   ```bash
-   npm run worker
-   ```
+   This also starts the sending engine (you'll see one `[engine] started` line). It sends due emails, checks inboxes for replies, writes AI emails ahead of time and checks new leads' addresses, for as long as the app runs. Pause and resume all sending with the switch at the bottom of the sidebar. If you run the app on another port (e.g. `next dev -p 3001`), set `APP_URL` to match.
 
 Then:
-1. Mailboxes → add info@grevya.com (GoDaddy preset) → Test connection → Send test email to your Gmail.
+1. Email accounts → add info@grevya.com (GoDaddy preset) → Test connection → Send test email to your Gmail.
 2. Leads → Import CSV with a tag.
 3. Campaigns → New → edit the sequence → Settings (your offer for the AI) → Leads tab: add the tag → Launch.
 
 ## Running it 24/7
 
-The engine has to run every minute during sending hours. Pick one:
+The engine has to keep running during sending hours. Pick one:
 
-- **Worker:** run `npm run worker` on any always-on machine (a small VPS, Railway, Render, or your laptop while it's awake).
-- **Cron:** deploy the app (e.g. Vercel) and have a free cron (cron-job.org) call `GET https://your-domain/api/engine/tick` every minute with the header `Authorization: Bearer $CRON_SECRET`.
+- **App server (simplest):** `npm run build && npm start` on any always-on machine (a small VPS, Railway, Render, or your laptop while it's awake). The engine starts with the app, just like `npm run dev`.
+- **Separate worker (optional):** to send from a different machine than the dashboard, run `npm run worker` there and set `ENGINE_IN_APP=off` on the web app so only one machine sends.
+- **Serverless (e.g. Vercel):** the in-app engine doesn't run there. Have a free cron (cron-job.org) call `GET https://your-domain/api/engine/tick` every minute with the header `Authorization: Bearer $CRON_SECRET`.
 
 Set `APP_URL` to the public URL once deployed. Unsubscribe links (and open/click tracking, if enabled) point there.
 
@@ -88,6 +86,6 @@ Set `APP_URL` to the public URL once deployed. Unsubscribe links (and open/click
 
 - SPF ✅ and DMARC ✅ are already published. **Turn on DKIM** in GoDaddy email settings; it wasn't found under common selectors.
 - Keep warm-up on. Sending 400/day from a new or cold mailbox on day 1 will land in spam.
-- Keep bounces under 2–3%: run **Verify new** on every import.
+- Keep bounces under 2–3%: let the background email checks finish before launching a campaign on a new import.
 - Plain text, no images, 0–1 links, and a real `{{ai_line}}`.
 - Sending cold email from your main domain risks normal mail going to spam. To scale past 400/day, add mailboxes on a secondary domain (e.g. `getgrevya.com`) and attach them to the same campaign. The engine rotates automatically.

@@ -255,7 +255,7 @@ export async function findEmail(input: FindInput): Promise<FindResult | { ok: fa
       ? `${provider ?? domain}'s mail server refuses checks from this internet connection — using other evidence. (It works when the app runs on a server.)`
       : `${domain}'s mail server didn't answer — using other evidence.`);
   } else {
-    notes.push("Mailbox checks need outgoing port 25, which this network blocks — using other evidence.");
+    notes.push("This network can't ask mail servers whether a mailbox exists — using other evidence.");
   }
 
   // (2) Gravatar: independent proof that an address is real (works on accept-all domains).

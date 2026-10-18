@@ -1,4 +1,4 @@
-// "Find emails by company" (Hunter's Domain Search): everything we can legitimately learn about
+// "Find emails by company" (company-wide search): everything we can legitimately learn about
 // a company's addresses — people published on its own website, leads you already have there,
 // the email format the company uses, and the mail setup — in one call.
 import { crawlSitePeople, domainAgeDays, resolveCompanyDomain, type CompanyMatch } from "./email-intel";
@@ -116,7 +116,7 @@ export async function searchDomain(input: string): Promise<DomainSearchResult | 
     ? { key: top[0], example: (PATTERN_EXAMPLE[top[0]] ?? ((d: string) => `?@${d}`))(domain), confidence: Math.round(Math.min(97, 50 + (top[1].n / Math.max(1, totalVotes)) * 30 + Math.min(17, top[1].n * 4))), evidence: top[1].why }
     : null;
   if (!pattern) notes.push("No named addresses found on the website or in your leads yet — use “Find by name” and the first confirmed result teaches the format.");
-  if (!(await canProbeSmtp())) notes.push("Mailbox confirmation needs outgoing port 25 (blocked on this network); results here come from the website and your data.");
+  if (!(await canProbeSmtp())) notes.push("This network can't ask mail servers whether a mailbox exists, so results here come from the website and your data.");
 
   const all = [...people.values()];
   return {

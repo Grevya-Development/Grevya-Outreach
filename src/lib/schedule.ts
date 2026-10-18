@@ -63,3 +63,111 @@ export function isPublicUrl(url: string): boolean {
 export function randomBetween(min: number, max: number): number {
   return Math.round(min + Math.random() * (max - min));
 }
+
+type WindowFields = Pick<PublicMailbox, "timezone" | "window_start" | "window_end" | "send_days">;
+type LimitFields = Pick<PublicMailbox, "daily_limit" | "warmup_enabled" | "warmup_start" | "warmup_increment" | "warmup_started_at">;
+
+/** The next moment this mailbox may send: `now` when inside its window, else the start of the next window hour (within 8 days). */
+export function nextWindowStart(mb: WindowFields, now = new Date()): Date | null {
+  if (inSendingWindow(mb, now)) return now;
+  // Step to the next full local hour (timezones like IST are offset by half an hour), then hour by hour.
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone: mb.timezone, minute: "numeric", second: "numeric" }).formatToParts(now);
+  const min = Number(parts.find((p) => p.type === "minute")?.value ?? 0);
+  const sec = Number(parts.find((p) => p.type === "second")?.value ?? 0);
+  let t = now.getTime() - sec * 1000 - now.getMilliseconds() + (60 - min) * 60_000;
+  for (let i = 0; i < 8 * 24; i++, t += 3_600_000) {
+    if (inSendingWindow(mb, new Date(t))) return new Date(t);
+  }
+  return null;
+}
+
+/** Day of the warm-up (1 = first day) and the date it reaches the account's daily limit; null when warm-up is off or finished. */
+export function warmupInfo(mb: LimitFields, now = new Date()): { day: number; fullOn: string } | null {
+  if (!mb.warmup_enabled) return null;
+  const cap = Math.min(mb.daily_limit, MAILBOX_HARD_CAP);
+  if (effectiveDailyLimit(mb, now) >= cap) return null;
+  const started = new Date(`${mb.warmup_started_at}T00:00:00Z`).getTime();
+  const day = Math.max(0, Math.floor((now.getTime() - started) / 86_400_000)) + 1;
+  const daysToCap = mb.warmup_increment > 0 ? Math.ceil((cap - mb.warmup_start) / mb.warmup_increment) : 0;
+  return { day, fullOn: new Date(started + daysToCap * 86_400_000).toISOString().slice(0, 10) };
+}
+
+/**
+ * How many emails a campaign can send per day: the sum of its active accounts' limits today
+ * (warm-up included), capped by the campaign daily limit (10000 = no extra limit).
+ */
+export function effectiveCampaignCapacity(
+  mailboxes: (LimitFields & Pick<PublicMailbox, "id" | "email" | "status">)[], campaignLimit: number, now = new Date(),
+): { perDay: number; accountsTotal: number; cappedByCampaign: boolean; breakdown: { id: string; email: string; perDay: number; warmupDay: number | null }[] } {
+  const breakdown = mailboxes.filter((m) => m.status === "active").map((m) => ({
+    id: m.id, email: m.email, perDay: effectiveDailyLimit(m, now), warmupDay: warmupInfo(m, now)?.day ?? null,
+  }));
+  const accountsTotal = breakdown.reduce((s, m) => s + m.perDay, 0);
+  const capped = campaignLimit > 0 && campaignLimit < 10000 && campaignLimit < accountsTotal;
+  return { perDay: capped ? campaignLimit : accountsTotal, accountsTotal, cappedByCampaign: capped, breakdown };
+}
+
+/** Adds `n` sending days (days in `sendDays`, 0=Sun) to a date; n = 0 returns the first sending day on or after it. */
+function addSendDays(from: Date, n: number, sendDays: number[]): Date {
+  const days = sendDays.length ? sendDays : [0, 1, 2, 3, 4, 5, 6];
+  const d = new Date(from.getTime());
+  let left = n;
+  for (let guard = 0; guard < 3660; guard++) {
+    if (days.includes(d.getUTCDay())) {
+      if (left <= 0) return d;
+      left--;
+    }
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  return d;
+}
+
+/** Sending days needed until everyone has had Email 1. */
+export function daysForFirstEmails(leadsRemaining: number, perDay: number): number {
+  return perDay > 0 ? Math.max(1, Math.ceil(leadsRemaining / perDay)) : 0;
+}
+
+/**
+ * Rough date the whole sequence finishes: the last lead gets Email 1 once the daily capacity has
+ * worked through everyone, then waits the sequence's delays. Never earlier than all emails
+ * (leads × steps) divided by the daily capacity. Null when nothing can be sent.
+ */
+export function estimateFinish(args: { leadsRemaining: number; steps: number[]; perDay: number; startDate: Date; sendDays: number[] }): Date | null {
+  const { leadsRemaining, steps, perDay, startDate, sendDays } = args;
+  if (perDay <= 0 || !steps.length) return null;
+  if (leadsRemaining <= 0) return startDate;
+  const firstWave = addSendDays(startDate, daysForFirstEmails(leadsRemaining, perDay) - 1, sendDays);
+  const delays = steps.slice(1).reduce((s, d) => s + Math.max(0, d), 0);
+  const byDelays = addSendDays(new Date(firstWave.getTime() + delays * 86_400_000), 0, sendDays);
+  const byVolume = addSendDays(startDate, Math.max(0, Math.ceil((leadsRemaining * steps.length) / perDay) - 1), sendDays);
+  return byDelays > byVolume ? byDelays : byVolume;
+}
+
+const DAY_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const TZ_SHORT: Record<string, string> = {
+  "Asia/Kolkata": "IST", "Asia/Calcutta": "IST", UTC: "UTC", "Etc/UTC": "UTC", "Europe/London": "UK time",
+  "America/New_York": "US Eastern", "America/Chicago": "US Central", "America/Denver": "US Mountain", "America/Los_Angeles": "US Pacific",
+  "Asia/Dubai": "Gulf time", "Asia/Singapore": "Singapore time", "Australia/Sydney": "Sydney time", "Europe/Berlin": "Central Europe",
+};
+
+/** 'Mon–Fri' / 'Mon, Wed, Fri' / 'Every day'. */
+export function describeDays(sendDays: number[]): string {
+  const days = [...new Set(sendDays)].filter((d) => d >= 0 && d <= 6).sort((a, b) => a - b);
+  if (days.length === 7) return "Every day";
+  if (!days.length) return "No days";
+  // Weeks start on Monday: Sunday counts as day 7.
+  const ordered = days[0] === 0 ? [...days.slice(1), 7] : days;
+  const runs: number[][] = [];
+  for (const d of ordered) {
+    const last = runs.at(-1);
+    if (last && d === last.at(-1)! + 1) last.push(d);
+    else runs.push([d]);
+  }
+  return runs.map((r) => (r.length >= 3 ? `${DAY_NAMES[r[0] % 7]}–${DAY_NAMES[r.at(-1)! % 7]}` : r.map((d) => DAY_NAMES[d % 7]).join(", "))).join(", ");
+}
+
+/** 'Mon–Fri · 09:00–18:00 · IST' */
+export function describeWindow(mb: WindowFields): string {
+  const hh = (h: number) => `${String(h).padStart(2, "0")}:00`;
+  return `${describeDays(mb.send_days)} · ${hh(mb.window_start)}–${hh(mb.window_end)} · ${TZ_SHORT[mb.timezone] ?? mb.timezone}`;
+}

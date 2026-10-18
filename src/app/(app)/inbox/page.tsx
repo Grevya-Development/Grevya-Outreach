@@ -1,65 +1,81 @@
+import { PenLine } from "lucide-react";
 import { connection } from "next/server";
 import { Suspense } from "react";
-import { PageHeader, Skeleton } from "@/components/ui";
+import { Button, PageHeader, Skeleton } from "@/components/ui";
+import { filterOptions, getReplyRow, inboxCounts, listReplies, PAGE_SIZE, parseQuery } from "@/lib/inbox-data";
 import { db, must } from "@/lib/supabase";
-import type { Mailbox, Reply } from "@/lib/types";
-import { InboxView, NewEmailButton, type InboxRow } from "./inbox-client";
+import type { Mailbox } from "@/lib/types";
+import { NewEmailButton } from "./compose";
+import { InboxView } from "./inbox-client";
 
 export const metadata = { title: "Inbox" };
 
 export default function InboxPage({ searchParams }: PageProps<"/inbox">) {
   return (
     <>
-      <PageHeader title="Inbox" description="Every reply from every mailbox. Answer, set a reminder, or mark it done — nothing falls through."
-        actions={<Suspense fallback={null}><Compose /></Suspense>} />
-      <Suspense fallback={<div className="grid md:grid-cols-[360px_1fr] gap-4"><Skeleton className="h-[520px]" /><Skeleton className="h-[520px]" /></div>}>
-        <InboxData params={searchParams} />
+      <PageHeader title="Inbox" description="Every reply from every email account. Answer it, set a reminder, or mark it done."
+        actions={
+          <Suspense fallback={<Button variant="primary" disabled><PenLine size={15} />New email</Button>}>
+            <ComposeData searchParams={searchParams} />
+          </Suspense>
+        } />
+      <Suspense fallback={<InboxSkeleton />}>
+        <InboxData searchParams={searchParams} />
       </Suspense>
     </>
   );
 }
 
-async function Compose() {
+async function ComposeData({ searchParams }: { searchParams: PageProps<"/inbox">["searchParams"] }) {
   await connection();
-  const mbs = must(await db().from("mailboxes").select("id, email, status").order("created_at")) as Pick<Mailbox, "id" | "email" | "status">[];
-  return <NewEmailButton mailboxes={mbs.filter((m) => m.status !== "error")} />;
-}
-
-const FILTERS: Record<string, (q: ReturnType<typeof base>) => ReturnType<typeof base>> = {
-  // Needs a reply now: open, and not snoozed into the future.
-  todo: (q) => q.eq("kind", "reply").eq("handled", false).or(`follow_up_at.is.null,follow_up_at.lte.${new Date().toISOString()}`),
-  due: (q) => q.eq("handled", false).lte("follow_up_at", new Date().toISOString()),
-  later: (q) => q.eq("handled", false).gt("follow_up_at", new Date().toISOString()),
-  interested: (q) => q.eq("sentiment", "interested"),
-  done: (q) => q.eq("kind", "reply").eq("handled", true),
-  auto: (q) => q.in("kind", ["auto_reply", "bounce"]),
-  all: (q) => q,
-};
-
-function base() {
-  return db().from("replies").select("*, campaigns(name), mailboxes(email)").order("received_at", { ascending: false }).limit(200);
-}
-
-async function InboxData({ params }: { params: PageProps<"/inbox">["searchParams"] }) {
-  await connection(); // filters use the current time — render at request time
-  const sp = await params;
-  const filter = typeof sp.f === "string" && sp.f in FILTERS ? sp.f : "todo";
-  const [rows, counts] = await Promise.all([
-    FILTERS[filter](base()).then(must),
-    Promise.all(["todo", "due", "later"].map(async (k) => {
-      const q = db().from("replies").select("id", { count: "exact", head: true });
-      const r = await (k === "todo" ? q.eq("kind", "reply").eq("handled", false).or(`follow_up_at.is.null,follow_up_at.lte.${new Date().toISOString()}`)
-        : k === "due" ? q.eq("handled", false).lte("follow_up_at", new Date().toISOString())
-        : q.eq("handled", false).gt("follow_up_at", new Date().toISOString()));
-      return [k, r.count ?? 0] as const;
-    })),
+  const [sp, mailboxes] = await Promise.all([
+    searchParams,
+    db().from("mailboxes").select("id, email, status").order("created_at").then(must),
   ]);
   return (
+    <NewEmailButton mailboxes={mailboxes as Pick<Mailbox, "id" | "email" | "status">[]}
+      defaultOpen={sp.compose === "1"} defaultTo={typeof sp.to === "string" ? sp.to : ""} />
+  );
+}
+
+async function InboxData({ searchParams }: { searchParams: PageProps<"/inbox">["searchParams"] }) {
+  await connection(); // the views depend on the current time
+  const sp = await searchParams;
+  const query = parseQuery(sp);
+  const initialId = typeof sp.id === "string" ? sp.id : undefined;
+  const [rows, counts, options, linked] = await Promise.all([
+    listReplies({ ...query, before: undefined, since: undefined }),
+    inboxCounts(),
+    filterOptions(),
+    initialId ? getReplyRow(initialId) : null,
+  ]);
+  // A link to one conversation opens it even when it isn't in the current view.
+  const all = linked && !rows.some((r) => r.id === linked.id) ? [linked, ...rows] : rows;
+  return (
     <InboxView
-      replies={rows as unknown as (Reply & InboxRow)[]}
-      filter={filter}
-      counts={Object.fromEntries(counts)}
-      initialId={typeof sp.id === "string" ? sp.id : undefined}
+      rows={all}
+      hasMore={rows.length >= PAGE_SIZE}
+      cursor={{ newest: rows[0]?.received_at ?? null, oldest: rows.at(-1)?.received_at ?? null }}
+      counts={counts}
+      options={options}
+      filter={{ f: query.f, label: query.label ?? "", campaign: query.campaign ?? "", account: query.account ?? "", q: query.q ?? "" }}
+      initialId={linked ? linked.id : undefined}
+      renderedAt={requestTime()}
     />
+  );
+}
+
+/** When this payload was made. The client compares it to spot a payload replayed from the router cache. */
+function requestTime(): number {
+  return Date.now(); // request-time render (after connection()), so this is the real "now"
+}
+
+function InboxSkeleton() {
+  return (
+    <div className="grid gap-4 md:grid-cols-[280px_minmax(0,1fr)] xl:grid-cols-[190px_320px_minmax(0,1fr)]">
+      <Skeleton className="h-10 md:col-span-2 xl:col-span-1 xl:h-[300px]" />
+      <Skeleton className="h-[520px]" />
+      <Skeleton className="hidden md:block h-[520px]" />
+    </div>
   );
 }

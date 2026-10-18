@@ -1,5 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import { tick } from "@/lib/engine";
+import { verifyPending } from "@/lib/verify-queue";
 
 export const maxDuration = 300;
 
@@ -13,7 +14,9 @@ async function handle(req: Request) {
     return Response.json({ error: "unauthorized" }, { status: 401 });
   }
   const result = await tick({ prepareMs: 45_000 });
-  return Response.json(result);
+  // Serverless has no in-app engine, so the background email checks run from this cron too.
+  const verified = await verifyPending(25);
+  return Response.json({ ...result, verified });
 }
 
 export const GET = handle;

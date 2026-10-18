@@ -1,4 +1,4 @@
-// Hunter-style verification report: the plain verdict plus the four sub-checks people expect
+// Verification report: the plain verdict plus the four sub-checks people expect
 // (Format, Type, Server status, Email status), with Gravatar and domain-age signals layered on
 // top of the core check. Pure presentation logic — the core check lives in email-verify.ts.
 import { domainAgeDays, hasGravatar } from "./email-intel";

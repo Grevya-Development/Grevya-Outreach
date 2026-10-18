@@ -6,6 +6,7 @@ import { Card, Empty, Skeleton, TableSkeleton } from "@/components/ui";
 import { composeEmail } from "@/lib/compose";
 import { CAMPAIGN_LEAD_STATUS_LABEL, PREP_LABEL } from "@/lib/labels";
 import { getLaunchChecklist } from "@/lib/launch-checklist";
+import { getPlaybook } from "@/lib/playbook";
 import { getProfile } from "@/lib/profile";
 import { describeWindow, effectiveDailyLimit, MAILBOX_HARD_CAP, nextWindowStart, warmupInfo } from "@/lib/schedule";
 import { checkContent } from "@/lib/spamcheck";
@@ -267,9 +268,12 @@ async function OptionsView({ data, builder }: ViewProps) {
   await connection();
   const { campaign: c } = data;
   const q = db().from("campaign_leads").select("id", { count: "exact", head: true }).eq("campaign_id", c.id).eq("status", "queued").eq("current_step", 0);
-  const writtenCount = await (c.mode === "ai" ? q.in("prep_status", ["ready", "review"]) : q.not("personalization", "is", null)).then(headCount);
+  const [writtenCount, playbook] = await Promise.all([
+    (c.mode === "ai" ? q.in("prep_status", ["ready", "review"]) : q.not("personalization", "is", null)).then(headCount),
+    c.mode === "ai" ? getPlaybook(c.id) : undefined,
+  ]);
   const nav = builderNav(c.id, "options", builder);
-  return <OptionsTab campaign={c} builder={builder} writtenCount={writtenCount} backHref={nav.backHref} nextHref={nav.nextHref} />;
+  return <OptionsTab campaign={c} builder={builder} writtenCount={writtenCount} playbook={playbook} backHref={nav.backHref} nextHref={nav.nextHref} />;
 }
 
 /* ───────────── Launch ───────────── */
@@ -309,10 +313,15 @@ async function ReviewView({ data, sp }: ViewProps) {
       id: sel.id,
       prepError: sel.prep_error,
       edited: sel.personalization?.edited === true,
+      version: String(sel.personalization?.generated_at ?? ""),
       lead: { name: nameOf(sel.leads), email: sel.leads.email, title: sel.leads.title, company: sel.leads.company || a?.company_name || "", website: sel.leads.website || sel.research?.domain || "" },
       fit: sel.fit_score,
       research: sel.research ? {
         whatTheyDo: a?.what_they_do ?? "", facts: a?.facts ?? [], bestService: a?.best_service ?? "", angle: a?.angle ?? "", fitReason: a?.fit_reason ?? "",
+        industry: a?.industry ?? "", industryContext: a?.industry_context ?? "",
+        useCases: (a?.use_cases ?? []).slice(0, 3).map((u) => ({
+          title: u.title, pillar: u.pillar, problem: u.problem, solution: u.solution, outcome: u.outcome, firstStep: u.first_step, fromSite: u.grounded_in === "fact",
+        })),
         failed: sel.research.status === "failed" ? `Their website couldn't be read${sel.research.error ? `: ${sel.research.error}` : ""}.` : null,
       } : null,
       emails: (sel.personalization?.emails ?? []).map((e) => ({ subject: e.subject ?? "", body: e.body ?? "" })),
@@ -323,7 +332,7 @@ async function ReviewView({ data, sp }: ViewProps) {
 
   return (
     <ReviewTab campaign={{ id: c.id, name: c.name, require_approval: c.require_approval }} view={view}
-      queue={rows.map((r) => ({ id: r.id, name: r.leads ? nameOf(r.leads) : "—", company: r.leads?.company ?? "", fit: r.fit_score }))}
+      queue={rows.map((r) => ({ id: r.id, name: r.leads ? nameOf(r.leads) : "—", company: r.leads?.company ?? "", fit: r.fit_score, useCase: r.use_case ?? null, pillar: r.pillar ?? null }))}
       counts={counts} selected={selected}
       progress={{ done: progress.total - progress.writing, total: progress.total, writing: progress.writing }}
       approved={progress.ready} nextSend={nextSend?.toISOString() ?? null} stepCount={data.steps.length} defaultTo={defaultTo(data)} />

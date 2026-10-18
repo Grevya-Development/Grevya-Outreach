@@ -141,7 +141,7 @@ export async function AnalyticsTab({ id, range: rawRange }: { id: string; range?
 
           <Card className="overflow-hidden">
             <CardHeader title="Each email" description={range === "all" ? undefined : `Emails sent in the last ${RANGE_LABEL[range]}. Replies are counted after the last email a lead got.`} />
-            <div className="overflow-x-auto">
+            <div className="relative overflow-x-auto">
               <table className="w-full text-[13px]">
                 <thead className="bg-panel-2/50">
                   <tr><Th>Email</Th><Th className="text-right">Sent</Th><Th className="text-right">Replies after this email</Th><Th className="text-right">Reply %</Th><Th className="text-right">Bounced</Th></tr>

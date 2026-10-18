@@ -225,6 +225,7 @@ export const getCampaignLeadsPage = cache(async (id: string, mode: Campaign["mod
 export type ReviewView = "to_review" | "failed";
 export type ReviewQueueRow = {
   id: string; fit_score: number | null; prep_error: string | null;
+  use_case: string | null; pillar: string | null;
   leads: Pick<Lead, "email" | "first_name" | "last_name" | "company"> | null;
 };
 
@@ -234,7 +235,7 @@ export const getReviewQueue = cache(async (id: string, view: ReviewView) => {
   const head = (prep: string) => supa.from("campaign_leads").select("id", { count: "exact", head: true })
     .eq("campaign_id", id).eq("status", "queued").eq("prep_status", prep).then((r) => r.count ?? 0);
   const [rows, toReview, failed] = await Promise.all([
-    supa.from("campaign_leads").select("id, fit_score, prep_error, leads(email, first_name, last_name, company)")
+    supa.from("campaign_leads").select("id, fit_score, prep_error, use_case:personalization->>use_case, pillar:personalization->>pillar, leads(email, first_name, last_name, company)")
       .eq("campaign_id", id).eq("status", "queued").eq("prep_status", view === "failed" ? "failed" : "review")
       .order("created_at").order("id").limit(200).then(must),
     head("review"),

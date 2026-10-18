@@ -203,6 +203,11 @@ function StepEditor({ ai, index, step, active, campaignId, customKeys, onFocus, 
             <label htmlFor={`step-${index}`} className="text-[12px] text-muted">What should this email say? (instructions for the AI)</label>
             <Textarea id={`step-${index}`} rows={3} value={step.body} onChange={(e) => onChange({ body: e.target.value })} className="text-[13.5px]"
               placeholder={index === 0 ? "e.g. Open with a specific detail about their company and connect it to our best-fit service with one proof point." : "e.g. Share a different use case for their industry."} />
+            <p className="text-[11.5px] text-faint">
+              {index === 0
+                ? "The AI builds this email around the best of 3 use cases it drafts for each lead. Style, structure, length and tone are set in Options → AI playbook."
+                : "Pitches the next use case from the lead's research (or nudges the same one, per your playbook)."}
+            </p>
           </>
         ) : (
           <>

@@ -9,14 +9,18 @@ import { Button, Card, CardHeader, Field, Select, Textarea } from "@/components/
 import { fmtNum } from "@/lib/format";
 import { EditFooter, useUnsavedGuard } from "./builder";
 import { Toggle } from "./campaign-client";
+import { PlaybookCard } from "./playbook-card";
+import type { Playbook } from "@/lib/playbook-shared";
 
 type Options = Pick<CampaignSettings, "stop_on_reply" | "include_unsubscribe" | "track_opens" | "track_clicks" | "require_approval" | "min_fit_score" | "sender_context" | "ai_prompt" | "ai_enabled">;
 
-export function OptionsTab({ campaign, builder, writtenCount, backHref, nextHref }: {
+export function OptionsTab({ campaign, builder, writtenCount, playbook, backHref, nextHref }: {
   campaign: Options & { id: string; status: string; mode: "ai" | "template" };
   builder: boolean;
   /** AI emails written for leads not yet contacted (deleted when the writing mode changes). */
   writtenCount: number;
+  /** AI mode only: the effective playbook for this campaign. */
+  playbook?: Playbook;
   backHref?: string;
   nextHref?: string;
 }) {
@@ -53,8 +57,8 @@ export function OptionsTab({ campaign, builder, writtenCount, backHref, nextHref
   };
 
   return (
-    <div className="grid gap-4 min-w-0">
-      <div className="grid lg:grid-cols-2 gap-4 items-start">
+    <div className="grid grid-cols-1 gap-4 min-w-0">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">
         <Card>
           <CardHeader title="Sending" />
           <div className="grid gap-4 px-4 pb-4">
@@ -91,7 +95,7 @@ export function OptionsTab({ campaign, builder, writtenCount, backHref, nextHref
                   <Textarea rows={3} value={f.sender_context} onChange={(e) => set("sender_context", e.target.value)}
                     placeholder="e.g. Operations heads at mid-size manufacturers in South India who still process invoices by hand." />
                 </Field>
-                <Field label="Extra instructions for the AI" hint="Optional: tone, what to stress, what to avoid.">
+                <Field label="Extra instructions for the AI" hint={ai ? "Optional. Most writing choices live in the AI playbook below." : "Optional: tone, what to stress, what to avoid."}>
                   <Textarea rows={3} value={f.ai_prompt} onChange={(e) => set("ai_prompt", e.target.value)}
                     placeholder="e.g. Lead with document processing. Keep it under 90 words." />
                 </Field>
@@ -100,6 +104,8 @@ export function OptionsTab({ campaign, builder, writtenCount, backHref, nextHref
           </div>
         </Card>
       </div>
+
+      {ai && playbook && <PlaybookCard campaignId={campaign.id} playbook={playbook} />}
 
       <Card className="border-bad/30">
         <CardHeader title="Danger zone" description={`Emails are ${ai ? "AI-written" : "written from your template"}. Changing this resets the sequence.`}

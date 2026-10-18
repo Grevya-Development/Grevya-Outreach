@@ -2,8 +2,10 @@
 
 import { refresh } from "next/cache";
 import type { ActionResult } from "@/components/client";
-import { verifyAddress, type VerifyResult } from "@/lib/email-verify";
-import { findEmail, type FindResult } from "@/lib/email-finder";
+import { searchDomain, type DomainSearchResult } from "@/lib/domain-search";
+import { verifyAddress } from "@/lib/email-verify";
+import { findEmail, type FindInput, type FindResult } from "@/lib/email-finder";
+import { buildReport, type VerifyReport } from "@/lib/verify-report";
 import { fmtNum } from "@/lib/format";
 import { db, must } from "@/lib/supabase";
 import { requireAuth } from "./auth";
@@ -12,13 +14,13 @@ import { requireAuth } from "./auth";
  * Verifies up to 25 addresses per call (the page calls this in batches to show progress). Leads
  * you already have with these addresses get the new result too.
  */
-export async function verifyBatch(emails: string[], force = false): Promise<VerifyResult[]> {
+export async function verifyBatch(emails: string[], force = false): Promise<VerifyReport[]> {
   await requireAuth();
   const list = [...new Set(emails.map((e) => e.trim().toLowerCase()).filter(Boolean))].slice(0, 25);
   // Small parallelism: friendly to DNS and to mail servers.
-  const out: VerifyResult[] = [];
+  const out: VerifyReport[] = [];
   for (let i = 0; i < list.length; i += 5) {
-    out.push(...(await Promise.all(list.slice(i, i + 5).map((e) => verifyAddress(e, { useCache: !force })))));
+    out.push(...(await Promise.all(list.slice(i, i + 5).map(async (e) => buildReport(await verifyAddress(e, { useCache: !force }))))));
   }
 
   // One update per result group; addresses that aren't leads simply match nothing.
@@ -32,10 +34,22 @@ export async function verifyBatch(emails: string[], force = false): Promise<Veri
   return out;
 }
 
-export async function findOne(input: { first: string; last: string; domain: string }): Promise<FindResult | { ok: false; error: string }> {
+/** Find email by name: a full name (or first/last) + a company name, website, domain or email. */
+export async function findOne(input: FindInput): Promise<FindResult | { ok: false; error: string }> {
   await requireAuth();
   try {
     return await findEmail(input);
+  } catch (err) {
+    return { ok: false, error: (err as Error).message };
+  }
+}
+
+/** Find emails by company: people and the email format, from the company website and your data. */
+export async function searchCompany(input: string): Promise<DomainSearchResult | { ok: false; error: string }> {
+  await requireAuth();
+  if (!input.trim()) return { ok: false, error: "Enter a company name or website" };
+  try {
+    return await searchDomain(input);
   } catch (err) {
     return { ok: false, error: (err as Error).message };
   }

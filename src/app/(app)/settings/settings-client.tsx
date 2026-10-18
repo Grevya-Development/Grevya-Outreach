@@ -65,7 +65,7 @@ export function SuppressionList({ rows }: { rows: { email: string; reason: strin
       ) : shown.length === 0 ? (
         <p className="px-4 pb-4 text-[13px] text-muted">No blocked emails match “{q.trim()}”.</p>
       ) : (
-        <div className="overflow-x-auto max-h-[480px] overflow-y-auto border-t border-line">
+        <div className="relative overflow-x-auto max-h-[480px] overflow-y-auto border-t border-line">
           <table className="w-full text-[13px]">
             <thead className="sticky top-0 bg-panel z-[1]">
               <tr><Th>Email</Th><Th>Reason</Th><Th>Added</Th><Th className="w-10"><span className="sr-only">Remove</span></Th></tr>

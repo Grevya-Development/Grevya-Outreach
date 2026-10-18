@@ -59,7 +59,7 @@ export function Select({ className, ...props }: ComponentProps<"select">) {
 
 export function Field({ label, hint, children, className }: { label: string; hint?: ReactNode; children: ReactNode; className?: string }) {
   return (
-    <label className={cx("grid gap-1.5", className)}>
+    <label className={cx("grid grid-cols-1 gap-1.5", className)}>
       <span className="text-[12.5px] font-medium text-ink">{label}</span>
       {children}
       {hint && <span className="text-[12px] text-muted leading-snug">{hint}</span>}

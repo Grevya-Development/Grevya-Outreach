@@ -132,7 +132,7 @@ export async function CampaignNav({ params, searchParams }: { params: Params; se
       const state: StepState = i === current ? "current" : i < current || doneByData[i] ? "done" : "todo";
       return { label: STEP_LABELS[s], href: viewHref(id, s, true), state };
     });
-    return <div className="overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"><Stepper steps={steps} /></div>;
+    return <div className="relative overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"><Stepper steps={steps} /></div>;
   }
 
   const progress = c.mode === "ai" ? await getAiProgress(id) : null;

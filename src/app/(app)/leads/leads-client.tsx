@@ -237,7 +237,7 @@ export function LeadsTable({
           {checking ? `Checking ${fmtNum(unchecked)} email${unchecked === 1 ? "" : "s"} in the background` : `${fmtNum(unchecked)} email${unchecked === 1 ? "" : "s"} will be checked when sending is on`}
         </div>
       ) : null}
-      <div className="overflow-x-auto">
+      <div className="relative overflow-x-auto">
         <table className="w-full text-[13px]">
           <thead className="bg-panel-2/50">
             <tr>

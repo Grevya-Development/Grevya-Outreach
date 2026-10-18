@@ -5,20 +5,26 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useRef, useState, useSyncExternalStore, useTransition } from "react";
 import { toast } from "sonner";
-import { approveLeads, rewriteLeads, skipCampaignLeads, updateLeadDraft } from "@/app/actions/campaigns";
+import { approveLeads, rewriteLeadWithNote, rewriteLeads, skipCampaignLeads, updateLeadDraft } from "@/app/actions/campaigns";
 import { Menu, ShortcutHelp, Spinner, useConfirm, useHotkeys, usePoll } from "@/components/client";
 import { Badge, Button, Card, Empty, Input, Kbd, Textarea, cx } from "@/components/ui";
 import { fmtDay, fmtNum, fmtTime } from "@/lib/format";
 import { FilterChip, TestStepDialog } from "./campaign-client";
 
-export type ReviewQueueItem = { id: string; name: string; company: string; fit: number | null };
+export type ReviewQueueItem = { id: string; name: string; company: string; fit: number | null; useCase: string | null; pillar: string | null };
+export type ReviewUseCase = { title: string; pillar: string; problem: string; solution: string; outcome: string; firstStep: string; fromSite: boolean };
 export type ReviewSelected = {
   id: string;
   prepError: string | null;
   edited: boolean;
+  /** When the drafts were generated; a rewrite changes it and resets the editor. */
+  version: string;
   lead: { name: string; email: string; title: string; company: string; website: string };
   fit: number | null;
-  research: { whatTheyDo: string; facts: string[]; bestService: string; angle: string; fitReason: string; failed: string | null } | null;
+  research: {
+    whatTheyDo: string; facts: string[]; bestService: string; angle: string; fitReason: string; failed: string | null;
+    industry: string; industryContext: string; useCases: ReviewUseCase[];
+  } | null;
   emails: { subject: string; body: string }[];
   /** 'Day 0', 'after 3 days', … per email. */
   sends: string[];
@@ -97,7 +103,7 @@ export function ReviewTab({ campaign, view, queue, counts, selected, progress, a
     return <div className="grid gap-3">{tabs}<Card>{body}</Card></div>;
   }
 
-  return <ReviewWorkspace key={selected.id} campaign={campaign} view={view} queue={queue} counts={counts} selected={selected} tabs={tabs}
+  return <ReviewWorkspace key={`${selected.id}:${selected.version}`} campaign={campaign} view={view} queue={queue} counts={counts} selected={selected} tabs={tabs}
     href={href} stepCount={stepCount} defaultTo={defaultTo} />;
 }
 
@@ -189,6 +195,19 @@ function ReviewWorkspace({ campaign, view, queue, counts, selected, tabs, href, 
       advance();
     });
   };
+  const rewriteNote = async (note: string): Promise<boolean> => {
+    if (editedRef.current || dirtySteps.current.size) {
+      const ok = await confirm({ title: "Rewrite with your note?", body: "You edited these emails by hand. The AI writes them again and your edits are lost.", confirmLabel: "Rewrite", tone: "danger" });
+      if (!ok) return false;
+    }
+    if (timer.current) clearTimeout(timer.current);
+    dirtySteps.current.clear();
+    const r = await rewriteLeadWithNote(selected.id, note);
+    if (!r.ok) { toast.error(r.error); return false; }
+    toast.success(r.message ?? "Rewritten");
+    router.refresh();
+    return true;
+  };
   const approveAll = async () => {
     const n = counts.to_review;
     const ok = await confirm({
@@ -229,7 +248,7 @@ function ReviewWorkspace({ campaign, view, queue, counts, selected, tabs, href, 
         </div>
       </div>
 
-      <div className="grid lg:grid-cols-[280px_minmax(0,1fr)] gap-4 items-start">
+      <div className="grid grid-cols-1 lg:grid-cols-[280px_minmax(0,1fr)] gap-4 items-start">
         <Card className="overflow-hidden lg:sticky lg:top-4">
           <div className="px-3 h-10 flex items-center justify-between border-b border-line text-[12.5px] text-muted">
             <span className="tabular-nums">{fmtNum(i + 1)} of {fmtNum(failedView ? counts.failed : counts.to_review)}</span>
@@ -242,6 +261,7 @@ function ReviewWorkspace({ campaign, view, queue, counts, selected, tabs, href, 
                 <span className="min-w-0 flex-1">
                   <span className="block text-[13px] font-medium truncate">{q.name}</span>
                   <span className="block text-[12px] text-muted truncate">{q.company || "—"}</span>
+                  {q.useCase && <span className="block text-[11.5px] text-faint truncate" title={`${q.useCase}${q.pillar ? ` · ${q.pillar}` : ""}`}>{q.useCase}{q.pillar ? ` · ${q.pillar}` : ""}</span>}
                 </span>
                 {q.fit != null && <Badge tone={q.fit >= 7 ? "good" : q.fit >= 4 ? "warn" : "bad"}>{q.fit}/10</Badge>}
               </button>
@@ -275,6 +295,7 @@ function ReviewWorkspace({ campaign, view, queue, counts, selected, tabs, href, 
                   {r.failed && <p className="text-bad">{r.failed}</p>}
                   {r.whatTheyDo && <p>{r.whatTheyDo}</p>}
                   {r.facts.length > 0 && <ul className="list-disc pl-4 text-muted grid gap-0.5">{r.facts.map((f) => <li key={f}>{f}</li>)}</ul>}
+                  {r.industry && <p><span className="text-faint">Industry:</span> {r.industry}{r.industryContext ? ` — ${r.industryContext}` : ""}</p>}
                   {r.bestService && <p><span className="text-faint">Best service:</span> {r.bestService}</p>}
                   {r.angle && <p><span className="text-faint">Angle:</span> {r.angle}</p>}
                   {r.fitReason && <p><span className="text-faint">Fit:</span> {r.fitReason}</p>}
@@ -282,6 +303,9 @@ function ReviewWorkspace({ campaign, view, queue, counts, selected, tabs, href, 
               </details>
             )}
           </Card>
+
+          {r && r.useCases.length > 0 && <UseCases items={r.useCases} />}
+          {!failedView && <RewriteWithNote disabled={busy} onSubmit={rewriteNote} />}
 
           {failedView ? (
             <Card className="px-4 py-4 text-[13px] grid gap-2">
@@ -323,5 +347,51 @@ function ReviewWorkspace({ campaign, view, queue, counts, selected, tabs, href, 
       )}
       {element}
     </div>
+  );
+}
+
+const PILLAR_TONE: Record<string, string> = {
+  "Gen AI": "bg-accent-soft text-accent",
+  "Agentic AI": "bg-good-soft text-good",
+  "Technology": "bg-panel-2 text-ink",
+  "Digital Transformation": "bg-warn-soft text-warn",
+};
+
+/** The 3 use cases the AI drafted for this lead. Email 1 uses the first; follow-ups use the next. */
+function UseCases({ items }: { items: ReviewUseCase[] }) {
+  return (
+    <div className="grid gap-2">
+      <div className="text-[12px] text-muted flex items-center gap-1.5"><Sparkles size={13} className="text-accent" />Use cases the AI found · Email 1 uses the first, follow-ups the next</div>
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+        {items.map((u, i) => (
+          <Card key={u.title + i} className="px-3 py-2.5 grid gap-1.5 content-start text-[12.5px]">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-faint tabular-nums">{i + 1}</span>
+              <span className={cx("rounded px-1.5 py-0.5 text-[11px] font-medium", PILLAR_TONE[u.pillar] ?? "bg-panel-2 text-ink")}>{u.pillar}</span>
+              <span className="text-[11px] text-faint ml-auto">{u.fromSite ? "from their website" : "industry knowledge"}</span>
+            </div>
+            <div className="font-medium text-[13px] leading-snug">{u.title}</div>
+            {u.problem && <p><span className="text-faint">Problem:</span> {u.problem}</p>}
+            {u.solution && <p><span className="text-faint">What we&apos;d build:</span> {u.solution}</p>}
+            {u.outcome && <p><span className="text-faint">Outcome:</span> {u.outcome}</p>}
+            {u.firstStep && <p className="text-muted"><span className="text-faint">First step:</span> {u.firstStep}</p>}
+          </Card>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** One-off instruction for this lead ("mention their new Pune plant"), rewritten right away. */
+function RewriteWithNote({ disabled, onSubmit }: { disabled: boolean; onSubmit: (note: string) => Promise<boolean> }) {
+  const [note, setNote] = useState("");
+  const [pending, start] = useTransition();
+  const submit = () => start(async () => { if (await onSubmit(note)) setNote(""); });
+  return (
+    <form className="flex flex-col sm:flex-row gap-2" onSubmit={(e) => { e.preventDefault(); if (note.trim() && !pending) submit(); }}>
+      <Input value={note} onChange={(e) => setNote(e.target.value)} maxLength={600} disabled={pending}
+        placeholder="Tell the AI what to change, e.g. “lead with use case 2” or “mention their new Pune plant”" aria-label="Note for the AI" className="flex-1" />
+      <Button type="submit" disabled={disabled || pending || !note.trim()}>{pending ? <Spinner /> : <RefreshCw size={14} />}{pending ? "Rewriting…" : "Rewrite with note"}</Button>
+    </form>
   );
 }

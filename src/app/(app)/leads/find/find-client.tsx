@@ -1,419 +1,576 @@
 "use client";
 
-import { CheckCircle2, Copy, Download, MailCheck, Search, UserPlus, UserSearch } from "lucide-react";
+import { Building2, CheckCircle2, ChevronDown, Copy, Download, Globe, MailCheck, Search, ShieldCheck, UserPlus, UserSearch, Users } from "lucide-react";
 import { useSearchParams } from "next/navigation";
-import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore, type ReactNode } from "react";
 import { toast } from "sonner";
-import { findOne, saveToLeads, verifyBatch } from "@/app/actions/verifier";
-import { AddLeadsDialog, type CampaignOption, type LeadPrefill } from "@/components/add-leads";
-import { Spinner, useAction, useConfirm } from "@/components/client";
-import { Badge, Button, Card, CardHeader, Field, Input, Select, Skeleton, StatusBadge, Td, Textarea, Th, cx } from "@/components/ui";
+import { findOne, saveToLeads, searchCompany, verifyBatch } from "@/app/actions/verifier";
+import type { CampaignOption } from "@/components/add-leads";
+import { Spinner } from "@/components/client";
+import { Badge, Button, Card, Empty, Skeleton, Td, Textarea, Th, cx, type Tone } from "@/components/ui";
+import type { DomainSearchResult } from "@/lib/domain-search";
 import type { FindResult } from "@/lib/email-finder";
-import type { VerifyResult } from "@/lib/email-verify";
 import { fmtNum } from "@/lib/format";
-import { VERIFY_LABEL } from "@/lib/labels";
+import type { VerifyReport } from "@/lib/verify-report";
 
-type Tab = "find" | "verify";
+type Mode = "company" | "name" | "verify";
+type Failure = { ok: false; error: string };
 const EMAIL_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi;
-const MAX_VERIFY = 1000;
 
-/** Results and inputs survive navigation (per browser tab). Only rendered after hydration (useHydrated), so reading storage up front is safe. */
+/* ───────────── small helpers ───────────── */
+
+/** Inputs and results survive navigation (per browser tab). Rendered only after hydration. */
 function useSessionState<T>(key: string, initial: T) {
   const [value, setValue] = useState<T>(() => {
     try {
       const raw = sessionStorage.getItem(key);
       return raw ? (JSON.parse(raw) as T) : initial;
     } catch {
-      return initial; // storage blocked or bad JSON: start empty
+      return initial;
     }
   });
   useEffect(() => {
-    try { sessionStorage.setItem(key, JSON.stringify(value)); } catch { /* full or blocked: not worth failing over */ }
+    try { sessionStorage.setItem(key, JSON.stringify(value)); } catch { /* storage full/blocked */ }
   }, [key, value]);
   return [value, setValue] as const;
 }
 
 const noSubscribe = () => () => {};
-/** False while rendering on the server and hydrating, true after (and on client-side navigations). */
 function useHydrated() {
   return useSyncExternalStore(noSubscribe, () => true, () => false);
 }
 
-/** Results saved before the rewording mention network ports; say it in plain words. */
-function plainReason(s: string): string {
-  return /port 25/i.test(s) ? "The domain accepts email, but this network can't ask its mail server whether the mailbox exists." : s;
+/** A status line that steps through what the lookup is doing, so a 10–20s wait never feels stuck. */
+function useProgressLine(active: boolean, steps: string[]) {
+  const [i, setI] = useState(0);
+  const [wasActive, setWasActive] = useState(active);
+  // Restart from the first step each time a lookup starts (adjusting state during render).
+  if (active !== wasActive) {
+    setWasActive(active);
+    if (active) setI(0);
+  }
+  useEffect(() => {
+    if (!active) return;
+    const id = setInterval(() => setI((n) => Math.min(n + 1, steps.length - 1)), 3500);
+    return () => clearInterval(id);
+  }, [active, steps.length]);
+  return steps[i];
 }
 
-const FOOTNOTE = <>This network can&apos;t talk to some mail servers directly, so some company addresses (e.g. GoDaddy) show <i>Couldn&apos;t confirm</i>. They can still be emailed; bounces are watched.</>;
+const initials = (s: string) => {
+  const parts = s.replace(/@.*/, "").split(/[\s._-]+/).filter(Boolean);
+  return ((parts[0]?.[0] ?? "") + (parts[1]?.[0] ?? parts[0]?.[1] ?? "")).toUpperCase() || "?";
+};
+
+function copy(text: string, what = "Copied") {
+  navigator.clipboard.writeText(text).then(() => toast.success(what), () => toast.error("Couldn't copy"));
+}
+
+function downloadCsv(name: string, rows: (string | number)[][]) {
+  const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+  a.download = name;
+  a.click();
+}
+
+const VERDICT: Record<FindResult["verdict"], { label: string; tone: Tone }> = {
+  confirmed: { label: "Confirmed", tone: "good" },
+  likely: { label: "Likely", tone: "warn" },
+  guess: { label: "Best guess", tone: "neutral" },
+};
+
+const VERIFY_TONE: Record<string, Tone> = { valid: "good", invalid: "bad", risky: "warn", unknown: "neutral" };
+const VERIFY_WORD: Record<string, string> = { valid: "Valid", invalid: "Invalid", risky: "Risky", unknown: "Unverifiable" };
+
+/* ───────────── page ───────────── */
 
 export function FindView({ campaigns, presetCampaign, smtpUnavailable }: { campaigns: CampaignOption[]; presetCampaign: string; smtpUnavailable: boolean }) {
   const sp = useSearchParams();
-  const tab: Tab = sp.get("tab") === "verify" ? "verify" : "find";
-  const setTab = (t: Tab) => {
-    // Switching tabs needs no server data, so only the URL changes (no round trip).
+  const initial = sp.get("mode") ?? (sp.get("tab") === "verify" ? "verify" : "name");
+  const [mode, setModeState] = useState<Mode>(initial === "company" || initial === "verify" ? initial : "name");
+  const setMode = (m: Mode) => {
+    setModeState(m);
     const next = new URLSearchParams(window.location.search);
-    if (t === "find") next.delete("tab");
-    else next.set("tab", t);
-    const qs = next.toString();
-    window.history.replaceState(null, "", qs ? `?${qs}` : window.location.pathname);
+    next.delete("tab");
+    next.set("mode", m);
+    window.history.replaceState(null, "", `?${next.toString()}`);
   };
-  const footnote = smtpUnavailable ? <p className="text-[12px] text-faint leading-snug">{FOOTNOTE}</p> : null;
-  // The tabs restore their inputs and results from sessionStorage, which the server can't see.
   const hydrated = useHydrated();
+  const target = campaigns.find((c) => c.id === presetCampaign) ?? null;
+
+  const save = async (rows: { email: string; first_name?: string; last_name?: string; company?: string; website?: string; status: string }[]) => {
+    const r = await saveToLeads(rows, ["found"], target?.id ?? null);
+    if (r.ok) toast.success(r.message ?? "Saved", r.action ? { action: { label: r.action.label, onClick: () => { window.location.href = r.action!.href; } } } : undefined);
+    else toast.error(r.error);
+  };
+
+  const TABS: [Mode, string, string, typeof Search][] = [
+    ["company", "Find email by company", "List the people and the email format at a company", Building2],
+    ["name", "Find email by name", "Find one person's work email", UserSearch],
+    ["verify", "Verify email", "Check if an email address is valid", MailCheck],
+  ];
 
   return (
-    <div className="grid gap-4">
-      <div role="tablist" aria-label="Find or verify" className="inline-flex rounded-lg border border-line p-0.5 justify-self-start">
-        {([["find", "Find email", UserSearch], ["verify", "Verify emails", MailCheck]] as const).map(([k, l, Icon]) => (
-          <button key={k} type="button" role="tab" aria-selected={tab === k} onClick={() => setTab(k)}
-            className={cx("h-8 px-3 rounded-md text-[13px] inline-flex items-center gap-1.5 transition-colors", tab === k ? "bg-accent-soft text-accent font-medium" : "text-muted hover:text-ink")}>
-            <Icon size={14} />{l}
+    <div className="grid gap-5 max-w-3xl mx-auto w-full">
+      <div role="tablist" aria-label="Find or verify" className="flex flex-wrap justify-center gap-1 rounded-xl border border-line bg-panel-2/60 p-1 sm:justify-self-center">
+        {TABS.map(([k, label, tip, Icon]) => (
+          <button key={k} type="button" role="tab" aria-selected={mode === k} title={tip} onClick={() => setMode(k)}
+            className={cx("h-9 px-3.5 rounded-lg text-[13.5px] inline-flex items-center gap-1.5 transition-colors",
+              mode === k ? "bg-panel text-ink font-medium shadow-[0_1px_2px_rgb(0_0_0/0.06),0_0_0_1px_var(--line)]" : "text-muted hover:text-ink")}>
+            <Icon size={15} />{label}
           </button>
         ))}
       </div>
-      {!hydrated ? <Skeleton className="h-44" /> : <>
-        {/* Both stay mounted so a running check keeps going while you look at the other tab. */}
-        <div className={tab === "find" ? "" : "hidden"}><FindTab campaigns={campaigns} preset={presetCampaign} footnote={footnote} /></div>
-        <div className={tab === "verify" ? "" : "hidden"}><VerifyTab campaigns={campaigns} preset={presetCampaign} footnote={footnote} /></div>
+      {target && <p className="text-center text-[12.5px] text-muted">Saved leads go straight into <b className="text-ink">{target.name}</b>.</p>}
+
+      {!hydrated ? <Skeleton className="h-16" /> : <>
+        {/* All three stay mounted, so a running lookup keeps going while you look at another tab. */}
+        <div className={mode === "company" ? "" : "hidden"}><CompanyTab save={save} /></div>
+        <div className={mode === "name" ? "" : "hidden"}><NameTab save={save} /></div>
+        <div className={mode === "verify" ? "" : "hidden"}><VerifyTab save={save} /></div>
       </>}
+
+      {smtpUnavailable && (
+        <p className="text-center text-[12px] text-faint leading-snug">
+          Some mail servers (GoDaddy, for example) refuse checks from this internet connection, so a few company addresses show “Unverifiable”. Everything else is checked live.
+        </p>
+      )}
     </div>
   );
 }
 
-/* ───────────── Find ───────────── */
+type SaveFn = (rows: { email: string; first_name?: string; last_name?: string; company?: string; website?: string; status: string }[]) => Promise<void>;
 
-type FindRow = { first: string; last: string; domain: string; result?: FindResult | { ok: false; error: string } };
+/* ───────────── the big Hunter-style search bar ───────────── */
 
-const isConfirmed = (r: FindResult) => r.best?.mailbox === "exists" || r.verdict === "confirmed";
+function SearchBar({ children, button, onSubmit, busy, disabled }: { children: ReactNode; button: string; onSubmit: () => void; busy: boolean; disabled?: boolean }) {
+  return (
+    <form onSubmit={(e) => { e.preventDefault(); if (!busy && !disabled) onSubmit(); }}
+      className="flex flex-col sm:flex-row items-stretch rounded-xl border border-line bg-panel shadow-[0_1px_3px_rgb(0_0_0/0.05)] focus-within:border-accent focus-within:ring-3 focus-within:ring-accent/15 overflow-hidden">
+      <div className="flex flex-1 flex-col sm:flex-row items-stretch min-w-0">{children}</div>
+      <div className="p-1.5 sm:pl-0">
+        <button type="submit" disabled={busy || disabled}
+          className="h-11 w-full sm:w-auto px-5 rounded-lg bg-accent text-accent-ink text-[14.5px] font-medium inline-flex items-center justify-center gap-2 hover:opacity-90 disabled:opacity-50 transition-opacity">
+          {busy ? <Spinner /> : <Search size={16} />}{button}
+        </button>
+      </div>
+    </form>
+  );
+}
 
-function FindTab({ campaigns, preset, footnote }: { campaigns: CampaignOption[]; preset: string; footnote: React.ReactNode }) {
-  const [f, setF] = useSessionState("leads-find:one", { first: "", last: "", domain: "" });
-  const [result, setResult] = useSessionState<FindResult | null>("leads-find:result", null);
-  const [bulk, setBulk] = useSessionState("leads-find:bulk", "");
-  const [rows, setRows] = useSessionState<FindRow[]>("leads-find:rows", []);
-  const [loading, setLoading] = useState(false);
-  const [bulkProgress, setBulkProgress] = useState<number | null>(null);
-  const [adding, setAdding] = useState<LeadPrefill | null>(null);
+const barInput = "h-14 w-full min-w-0 bg-transparent px-4 text-[15px] outline-none placeholder:text-faint";
 
-  const one = async () => {
-    if (!f.first.trim() || !f.domain.trim()) return;
-    setLoading(true);
-    setResult(null);
+function Working({ line }: { line: string }) {
+  return (
+    <Card className="p-5 grid gap-3 fade-in">
+      <div className="flex items-center gap-2 text-[13px] text-muted"><Spinner />{line}</div>
+      <div className="flex items-center gap-4"><Skeleton className="size-14 rounded-full" /><div className="grid gap-2 flex-1"><Skeleton className="h-5 w-2/3" /><Skeleton className="h-4 w-1/3" /></div></div>
+      <Skeleton className="h-20" />
+    </Card>
+  );
+}
+
+function Avatar({ text, tone = "neutral" }: { text: string; tone?: Tone }) {
+  return (
+    <div className={cx("size-14 shrink-0 rounded-full grid place-items-center text-[20px] font-medium",
+      tone === "good" ? "bg-good-soft text-good" : tone === "bad" ? "bg-bad-soft text-bad" : tone === "warn" ? "bg-warn-soft text-warn" : "bg-accent-soft text-accent")}>
+      {text}
+    </div>
+  );
+}
+
+function BulkToggle({ open, onClick, label }: { open: boolean; onClick: () => void; label: string }) {
+  return (
+    <button type="button" onClick={onClick} className="justify-self-center inline-flex items-center gap-1 text-[12.5px] text-muted hover:text-ink">
+      <ChevronDown size={14} className={cx("transition-transform", open && "rotate-180")} />{label}
+    </button>
+  );
+}
+
+/* ───────────── Find email by company ───────────── */
+
+function CompanyTab({ save }: { save: SaveFn }) {
+  const [q, setQ] = useSessionState("find:company:q", "");
+  const [res, setRes] = useSessionState<DomainSearchResult | null>("find:company:res", null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const line = useProgressLine(busy, ["Finding the company…", "Reading their website…", "Looking for people and published addresses…", "Working out their email format…"]);
+
+  const run = async (query = q) => {
+    setBusy(true); setError(""); setRes(null);
     try {
-      const r = await findOne(f);
-      if (!r.ok) toast.error(r.error);
-      else setResult(r);
-    } catch (err) {
-      toast.error((err as Error).message || "Something went wrong");
-    } finally {
-      setLoading(false);
-    }
+      const r = await searchCompany(query);
+      if (!r.ok) setError(r.error); else setRes(r);
+    } catch (e) { setError((e as Error).message || "Something went wrong"); } finally { setBusy(false); }
   };
 
-  const parsedBulk = useMemo<FindRow[]>(() => bulk.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).map((l) => {
-    const cells = l.split(/[,\t;]/).map((c) => c.trim()).filter(Boolean);
-    const domainCell = cells.find((c) => /\.[a-z]{2,}/i.test(c) && !/\s/.test(c)) ?? "";
-    const nameCells = cells.filter((c) => c !== domainCell);
-    const names = nameCells.length >= 2 ? [nameCells[0], nameCells[1]] : (nameCells[0] ?? "").split(/\s+/);
-    return { first: names[0] ?? "", last: names.slice(1).join(" "), domain: domainCell };
-  }).filter((r) => r.first && r.domain).slice(0, 100), [bulk]);
-
-  const runBulk = async () => {
-    setRows(parsedBulk.map((r) => ({ ...r })));
-    for (let i = 0; i < parsedBulk.length; i++) {
-      setBulkProgress(i);
-      const r = await findOne(parsedBulk[i]).catch((e) => ({ ok: false as const, error: (e as Error).message }));
-      setRows((prev) => prev.map((row, j) => (j === i ? { ...row, result: r } : row)));
-    }
-    setBulkProgress(null);
-  };
-
-  const found = rows.filter((r) => r.result?.ok && r.result.best);
   return (
     <div className="grid gap-4">
-      <Card className="p-4 grid gap-3">
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-          <Field label="First name"><Input value={f.first} placeholder="Priya" onChange={(e) => setF({ ...f, first: e.target.value })} /></Field>
-          <Field label="Last name"><Input value={f.last} placeholder="Sharma" onChange={(e) => setF({ ...f, last: e.target.value })} /></Field>
-          <Field label="Company website"><Input value={f.domain} placeholder="acme.com" onChange={(e) => setF({ ...f, domain: e.target.value })}
-            onKeyDown={(e) => { if (e.key === "Enter") void one(); }} /></Field>
-        </div>
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <span className="text-[12px] text-muted">{loading ? "Looking at the company's website and mail server. This can take up to 30 seconds." : "Works best with the company's website (acme.com)."}</span>
-          <Button variant="primary" onClick={() => void one()} disabled={loading || !f.first.trim() || !f.domain.trim()}>
-            {loading ? <><Spinner />Finding…</> : <><Search size={15} />Find email</>}
-          </Button>
-        </div>
-        {footnote}
-      </Card>
+      <SearchBar button="Find emails" busy={busy} disabled={!q.trim()} onSubmit={() => run()}>
+        <Globe size={18} className="hidden sm:block self-center ml-4 text-faint shrink-0" />
+        <input className={barInput} value={q} onChange={(e) => setQ(e.target.value)} placeholder="Company name or website, e.g. TVS Motor or tvsmotor.com" aria-label="Company" />
+      </SearchBar>
+      {error && <p className="text-[13px] text-bad text-center">{error}</p>}
+      {busy && <Working line={line} />}
 
-      {result && <FindCard r={result} first={f.first} last={f.last} onAdd={(p) => setAdding(p)} />}
-
-      <Card className="p-4 grid gap-3">
-        <div className="font-semibold text-[14px]">A list of people</div>
-        <Textarea rows={5} value={bulk} onChange={(e) => setBulk(e.target.value)} className="font-mono text-[12.5px]" aria-label="People to find, one per line"
-          placeholder={"Priya Sharma, acme.com\nRahul Mehta, delhivery.com\nAnita, Rao, tvsmotor.com"} />
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <span className="text-[12.5px] text-muted">One person per line: name and company website. Up to 100.{parsedBulk.length ? ` ${parsedBulk.length} ready.` : ""}</span>
-          <Button onClick={() => void runBulk()} disabled={!parsedBulk.length || bulkProgress !== null}>
-            {bulkProgress !== null ? <><Spinner />Finding {bulkProgress + 1} of {parsedBulk.length}…</> : <><UserSearch size={15} />Find all</>}
-          </Button>
-        </div>
-        {bulkProgress !== null && parsedBulk.length > 0 && (
-          <div className="h-1.5 rounded-full bg-panel-2 overflow-hidden"><div className="h-full bg-accent transition-[width] duration-300" style={{ width: `${(bulkProgress / parsedBulk.length) * 100}%` }} /></div>
-        )}
-        {rows.length > 0 && (
-          <>
-            <div className="overflow-x-auto rounded-lg border border-line">
-              <table className="w-full text-[13px]">
-                <thead className="bg-panel-2/50"><tr><Th>Lead</Th><Th>Website</Th><Th>Best email</Th><Th>Result</Th></tr></thead>
-                <tbody>
-                  {rows.map((r, i) => (
-                    <tr key={i}>
-                      <Td className="whitespace-nowrap">{r.first} {r.last}</Td>
-                      <Td className="text-muted">{r.domain}</Td>
-                      <Td className="font-medium">
-                        {!r.result ? <span className="text-faint font-normal">{bulkProgress === i ? "Finding…" : "Waiting"}</span>
-                          : !r.result.ok ? <span className="text-bad text-[12.5px] font-normal">{r.result.error}</span>
-                          : r.result.best?.email ?? <span className="text-faint font-normal">—</span>}
-                      </Td>
-                      <Td>{r.result?.ok ? <Verdict r={r.result} /> : null}</Td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+      {res && !busy && (
+        <div className="grid gap-4 fade-in">
+          {res.companyMatches.length > 1 && (
+            <p className="text-[12.5px] text-muted text-center">
+              Did you mean:{" "}
+              {res.companyMatches.filter((m) => m.domain !== res.domain).map((m, i) => (
+                <button key={m.domain} type="button" onClick={() => { setQ(m.domain); void run(m.domain); }} className="text-accent hover:underline">
+                  {i ? " · " : ""}{m.name} ({m.domain})
+                </button>
+              ))}
+            </p>
+          )}
+          <Card className="p-5 grid gap-3">
+            <div className="flex flex-wrap items-center gap-3">
+              <Avatar text={res.domain.slice(0, 2).toUpperCase()} />
+              <div className="min-w-0">
+                <div className="text-[17px] font-semibold">{res.domain}</div>
+                <div className="text-[12.5px] text-muted">{[res.provider, res.domainAgeDays != null && `domain ${Math.floor(res.domainAgeDays / 365)} yr old`, !res.acceptsMail && "no mail server"].filter(Boolean).join(" · ")}</div>
+              </div>
             </div>
-            {found.length > 0 && bulkProgress === null && (
-              <SaveForm campaigns={campaigns} preset={preset} label={`Add ${fmtNum(found.length)} as leads`} defaultList="found"
-                rows={found.map((r) => {
-                  const res = r.result as FindResult;
-                  return { email: res.best!.email, first_name: r.first, last_name: r.last, website: res.domain, status: isConfirmed(res) ? "valid" : "unknown" };
-                })} />
+            {res.pattern ? (
+              <div className="rounded-lg bg-panel-2/60 px-4 py-3">
+                <div className="text-[12px] uppercase tracking-wide text-faint">Email format</div>
+                <div className="flex flex-wrap items-center gap-2 mt-0.5">
+                  <span className="text-[15px] font-medium">{res.pattern.example}</span>
+                  <Badge tone={res.pattern.confidence >= 80 ? "good" : "warn"}>{res.pattern.confidence}% confidence</Badge>
+                </div>
+                <details className="mt-1.5 text-[12.5px] text-muted">
+                  <summary className="cursor-pointer select-none">Why we think so</summary>
+                  <ul className="mt-1 list-disc pl-4 grid gap-0.5">{res.pattern.evidence.map((e) => <li key={e}>{e}</li>)}</ul>
+                </details>
+              </div>
+            ) : (
+              <p className="text-[13px] text-muted">We couldn&apos;t work out their email format yet. Use “Find email by name”: the first confirmed result teaches it for everyone at {res.domain}.</p>
             )}
-          </>
-        )}
-      </Card>
+            {res.notes.map((n) => <p key={n} className="text-[12.5px] text-faint">{n}</p>)}
+          </Card>
 
-      {adding && <AddLeadsDialog campaigns={campaigns} defaultCampaignId={preset || undefined} defaultTab="one" prefill={adding} onClose={() => setAdding(null)} />}
+          <Card className="overflow-hidden">
+            <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-line">
+              <div className="font-semibold text-[14px] flex items-center gap-1.5"><Users size={15} />People <span className="text-faint font-normal">{fmtNum(res.people.length)}</span></div>
+              {res.people.length > 0 && (
+                <div className="flex gap-2">
+                  <Button size="sm" onClick={() => downloadCsv(`${res.domain}-emails.csv`, [["name", "email", "source"], ...res.people.map((p) => [p.name ?? "", p.email, p.source])])}><Download size={14} />CSV</Button>
+                  <Button size="sm" variant="primary" onClick={() => save(res.people.map((p) => ({ email: p.email, first_name: p.name?.split(" ")[0], last_name: p.name?.split(" ").slice(1).join(" "), website: res.domain, status: "unknown" })))}><UserPlus size={14} />Save all</Button>
+                </div>
+              )}
+            </div>
+            {res.people.length === 0 ? (
+              <Empty icon={<Users size={24} />} title="No people published on their website">Many companies don&apos;t list staff emails. Search a person by name instead.</Empty>
+            ) : (
+              <ul className="divide-y divide-line">
+                {res.people.map((p) => (
+                  <li key={p.email} className="flex flex-wrap items-center gap-3 px-4 py-2.5">
+                    <div className="size-9 shrink-0 rounded-full grid place-items-center bg-accent-soft text-accent text-[13px] font-medium">{initials(p.name ?? p.email)}</div>
+                    <div className="min-w-0 flex-1">
+                      <div className="font-medium truncate">{p.name ?? "Name not listed"}</div>
+                      <div className="text-[12.5px] text-muted truncate">{p.email}</div>
+                    </div>
+                    <Badge>{p.source === "website" ? "On their website" : "In your leads"}</Badge>
+                    <Button size="sm" variant="ghost" aria-label="Copy" onClick={() => copy(p.email)}><Copy size={14} /></Button>
+                    <Button size="sm" onClick={() => save([{ email: p.email, first_name: p.name?.split(" ")[0], last_name: p.name?.split(" ").slice(1).join(" "), website: res.domain, status: "unknown" }])}>Save as lead</Button>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {res.roleInboxes.length > 0 && (
+              <details className="border-t border-line px-4 py-3 text-[13px]">
+                <summary className="cursor-pointer select-none text-muted">Shared inboxes ({res.roleInboxes.length}): info@, sales@ and similar</summary>
+                <div className="mt-2 flex flex-wrap gap-2">{res.roleInboxes.map((r) => <button key={r.email} type="button" onClick={() => copy(r.email)} className="rounded-md bg-panel-2 px-2 py-1 text-[12.5px] hover:text-accent">{r.email}</button>)}</div>
+              </details>
+            )}
+          </Card>
+        </div>
+      )}
     </div>
   );
 }
 
-function Verdict({ r }: { r: FindResult }) {
-  if (!r.best) return <Badge dot>Not found</Badge>;
-  if (isConfirmed(r)) return <Badge tone="good" dot>Confirmed</Badge>;
-  return <Badge tone="warn" dot>Best guess</Badge>;
+/* ───────────── Find email by name ───────────── */
+
+type BulkRow = { name: string; company: string; result?: FindResult | Failure };
+
+function NameTab({ save }: { save: SaveFn }) {
+  const [f, setF] = useSessionState("find:name:q", { name: "", company: "" });
+  const [res, setRes] = useSessionState<FindResult | null>("find:name:res", null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [bulkOpen, setBulkOpen] = useSessionState("find:name:bulkOpen", false);
+  const [bulk, setBulk] = useSessionState("find:name:bulk", "");
+  const [rows, setRows] = useSessionState<BulkRow[]>("find:name:rows", []);
+  const [bulkAt, setBulkAt] = useState<number | null>(null);
+  const line = useProgressLine(busy, ["Finding the company…", "Reading their website for the email format…", "Asking their mail server…", "Checking public profiles…"]);
+
+  const run = async () => {
+    setBusy(true); setError(""); setRes(null);
+    try {
+      const r = await findOne({ name: f.name, company: f.company });
+      if (!r.ok) setError(r.error); else setRes(r);
+    } catch (e) { setError((e as Error).message || "Something went wrong"); } finally { setBusy(false); }
+  };
+
+  const parsed = useMemo<BulkRow[]>(() => bulk.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).map((l) => {
+    const at = l.match(/^(.*?)\s*@\s*(\S+)$/);
+    if (at) return { name: at[1], company: at[2] };
+    const cells = l.split(/[,\t;]/).map((c) => c.trim()).filter(Boolean);
+    return { name: cells.slice(0, -1).join(" "), company: cells[cells.length - 1] ?? "" };
+  }).filter((r) => r.name && r.company).slice(0, 100), [bulk]);
+
+  const runBulk = async () => {
+    setRows(parsed.map((r) => ({ ...r })));
+    for (let i = 0; i < parsed.length; i++) {
+      setBulkAt(i);
+      const r = await findOne(parsed[i]).catch((e) => ({ ok: false as const, error: (e as Error).message }));
+      setRows((prev) => prev.map((row, j) => (j === i ? { ...row, result: r } : row)));
+    }
+    setBulkAt(null);
+  };
+  const foundRows = rows.filter((r) => r.result?.ok && r.result.best);
+
+  return (
+    <div className="grid gap-4">
+      <SearchBar button="Find email" busy={busy} disabled={!f.name.trim() || !f.company.trim()} onSubmit={run}>
+        <input className={barInput} value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} placeholder="Full name, e.g. Priya Sharma" aria-label="Full name" />
+        <span className="hidden sm:grid place-items-center px-3 text-faint border-x border-line text-[15px]">@</span>
+        <input className={cx(barInput, "border-t border-line sm:border-t-0")} value={f.company} onChange={(e) => setF({ ...f, company: e.target.value })} placeholder="Company name or website" aria-label="Company" />
+      </SearchBar>
+      {error && <p className="text-[13px] text-bad text-center">{error}</p>}
+      {busy && <Working line={line} />}
+      {res && !busy && <FindCard r={res} onSave={() => save([{ email: res.best!.email, first_name: f.name.split(" ")[0], last_name: f.name.split(" ").slice(1).join(" "), website: res.domain, status: res.best!.mailbox === "exists" ? "valid" : "unknown" }])} />}
+
+      <BulkToggle open={bulkOpen} onClick={() => setBulkOpen(!bulkOpen)} label="Find many at once" />
+      {bulkOpen && (
+        <Card className="p-4 grid gap-3 fade-in">
+          <Textarea rows={5} value={bulk} onChange={(e) => setBulk(e.target.value)} className="font-mono text-[12.5px]"
+            placeholder={"Priya Sharma, acme.com\nRahul Mehta @ Delhivery\nAnita Rao, TVS Motor"} />
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <span className="text-[12.5px] text-muted">One person per line: name, then company name or website. Up to 100.{parsed.length ? ` ${parsed.length} ready.` : ""}</span>
+            <Button variant="primary" onClick={runBulk} disabled={!parsed.length || bulkAt !== null}>
+              {bulkAt !== null ? <><Spinner />Finding {bulkAt + 1} of {parsed.length}…</> : <><UserSearch size={15} />Find all</>}
+            </Button>
+          </div>
+          {rows.length > 0 && (
+            <>
+              <div className="relative overflow-x-auto rounded-lg border border-line">
+                <table className="w-full text-[13px]">
+                  <thead className="bg-panel-2/50"><tr><Th>Person</Th><Th>Company</Th><Th>Email</Th><Th>Result</Th></tr></thead>
+                  <tbody>
+                    {rows.map((r, i) => (
+                      <tr key={i}>
+                        <Td className="whitespace-nowrap">{r.name}</Td>
+                        <Td className="text-muted">{r.result?.ok ? r.result.domain : r.company}</Td>
+                        <Td className="font-medium">
+                          {!r.result ? <span className="text-faint">{bulkAt === i ? "searching…" : "waiting"}</span>
+                            : !r.result.ok ? <span className="text-bad text-[12.5px]">{r.result.error}</span>
+                            : r.result.best?.email ?? "—"}
+                        </Td>
+                        <Td>{r.result?.ok && r.result.best ? <Badge tone={VERDICT[r.result.verdict].tone} dot>{VERDICT[r.result.verdict].label} · {r.result.best.confidence}%</Badge> : null}</Td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {foundRows.length > 0 && bulkAt === null && (
+                <div className="flex justify-end gap-2">
+                  <Button size="sm" onClick={() => downloadCsv("found-emails.csv", [["name", "company", "email", "result", "confidence"], ...foundRows.map((r) => { const x = r.result as FindResult; return [r.name, x.domain, x.best!.email, VERDICT[x.verdict].label, x.best!.confidence]; })])}><Download size={14} />CSV</Button>
+                  <Button size="sm" variant="primary" onClick={() => save(foundRows.map((r) => { const x = r.result as FindResult; return { email: x.best!.email, first_name: r.name.split(" ")[0], last_name: r.name.split(" ").slice(1).join(" "), website: x.domain, status: x.best!.mailbox === "exists" ? "valid" : "unknown" }; }))}>
+                    <UserPlus size={14} />Save {foundRows.length} as leads
+                  </Button>
+                </div>
+              )}
+            </>
+          )}
+        </Card>
+      )}
+    </div>
+  );
 }
 
-function FindCard({ r, first, last, onAdd }: { r: FindResult; first: string; last: string; onAdd: (p: LeadPrefill) => void }) {
+function FindCard({ r, onSave }: { r: FindResult; onSave: () => void }) {
   const best = r.best;
-  const confirmed = isConfirmed(r);
-  const copy = (email: string) => navigator.clipboard.writeText(email).then(() => toast.success("Copied"), () => toast.error("Couldn't copy"));
-  const reason = best?.evidence[0] ?? r.notes.find((n) => !/port 25|this network can't ask/i.test(n));
-  const heading = !best ? "Not found" : confirmed ? "Confirmed"
-    : r.acceptAll ? "Best guess (this company's mail server accepts any address)" : "Best guess (couldn't confirm from this network)";
+  if (!best) return <Card><Empty icon={<UserSearch size={24} />} title="No likely address found">Check the company website and the spelling of the name.</Empty></Card>;
+  const v = VERDICT[r.verdict];
   return (
-    <Card className="fade-in">
-      <CardHeader title={`${first} ${last}`.trim() || r.name} description={`${r.domain}${r.provider ? ` · ${r.provider}` : ""}`} />
-      <div className="px-4 pb-4 grid gap-3">
-        <div className={cx("rounded-xl border p-3.5", confirmed ? "border-good/30 bg-good-soft" : "border-line bg-panel-2/50")}>
-          <div className={cx("text-[12.5px] font-medium", confirmed ? "text-good" : best ? "text-warn" : "text-muted")}>{heading}</div>
-          {best ? (
-            <div className="mt-1 flex flex-wrap items-center gap-2">
-              {confirmed && <CheckCircle2 size={17} className="text-good" />}
-              <span className="text-[16px] font-semibold break-all">{best.email}</span>
-              <button type="button" className="text-muted hover:text-ink" aria-label="Copy email" onClick={() => copy(best.email)}><Copy size={14} /></button>
-              <span className="text-[11.5px] text-faint tabular-nums">{best.confidence}% sure</span>
-            </div>
-          ) : <p className="mt-1 text-[13px] text-muted">No likely address. Check the website, or try the full name.</p>}
-          {reason && <p className="mt-1.5 text-[12.5px] text-muted">{reason}</p>}
+    <Card className="fade-in overflow-hidden">
+      <div className="flex flex-wrap items-center gap-4 p-5">
+        <Avatar text={initials(r.name || best.email)} tone={v.tone === "good" ? "good" : undefined} />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-[18px] font-semibold break-all">{best.email}</span>
+            {best.mailbox === "exists" && <CheckCircle2 size={18} className="text-good" />}
+          </div>
+          <div className="mt-1 flex flex-wrap items-center gap-2">
+            <Badge tone={v.tone} dot>{v.label} · {best.confidence}%</Badge>
+            <span className="text-[12.5px] text-muted">{r.name} · {r.domain}</span>
+          </div>
         </div>
-        {r.candidates.length > 1 && (
-          <details className="text-[12.5px]">
-            <summary className="cursor-pointer select-none text-muted">Other possibilities</summary>
-            <div className="mt-2 grid gap-1">
-              {r.candidates.slice(1).map((c) => (
-                <div key={c.email} className="flex items-center justify-between gap-3">
-                  <button type="button" className="truncate text-left hover:underline" title="Copy" onClick={() => copy(c.email)}>{c.email}</button>
-                  <span className="text-faint tabular-nums shrink-0">{c.mailbox === "exists" ? "confirmed" : `${c.confidence}%`}</span>
-                </div>
-              ))}
-            </div>
-          </details>
+        <div className="flex gap-2">
+          <Button size="sm" onClick={() => copy(best.email)}><Copy size={14} />Copy</Button>
+          <Button size="sm" variant="primary" onClick={onSave}><UserPlus size={14} />Save as lead</Button>
+        </div>
+      </div>
+      <div className="border-t border-line bg-panel-2/40 px-5 py-4 grid gap-3 text-[13px]">
+        {best.evidence.length > 0 && (
+          <div>
+            <div className="font-medium mb-1">Why we think so</div>
+            <ul className="list-disc pl-4 grid gap-0.5 text-muted">{best.evidence.map((e) => <li key={e}>{e}</li>)}</ul>
+          </div>
         )}
-        {best && (
-          <Button variant="secondary" className="justify-self-start"
-            onClick={() => onAdd({ email: best.email, first_name: first.trim(), last_name: last.trim(), website: r.domain })}>
-            <UserPlus size={15} />Add as lead
-          </Button>
+        {r.acceptAll && <p className="text-warn text-[12.5px]">This company accepts mail for any address, so its mail server can&apos;t confirm which one is real.</p>}
+        {r.notes.map((n) => <p key={n} className="text-[12.5px] text-faint">{n}</p>)}
+        {r.candidates.length > 1 && (
+          <details>
+            <summary className="cursor-pointer select-none text-muted">Other possibilities ({r.candidates.length - 1})</summary>
+            <ul className="mt-2 grid gap-1">
+              {r.candidates.slice(1).map((c) => (
+                <li key={c.email} className="flex items-center justify-between gap-3">
+                  <button type="button" onClick={() => copy(c.email)} className="truncate hover:text-accent text-left">{c.email}</button>
+                  <span className="text-faint tabular-nums shrink-0">{c.mailbox === "exists" ? "confirmed" : `${c.confidence}%`}</span>
+                </li>
+              ))}
+            </ul>
+          </details>
         )}
       </div>
     </Card>
   );
 }
 
-/* ───────────── Verify ───────────── */
+/* ───────────── Verify email ───────────── */
 
-function VerifyTab({ campaigns, preset, footnote }: { campaigns: CampaignOption[]; preset: string; footnote: React.ReactNode }) {
-  const [text, setText] = useSessionState("leads-verify:text", "");
-  const [results, setResults] = useSessionState<VerifyResult[]>("leads-verify:results", []);
+function VerifyTab({ save }: { save: SaveFn }) {
+  const [q, setQ] = useSessionState("find:verify:q", "");
+  const [res, setRes] = useSessionState<VerifyReport | null>("find:verify:res", null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [bulkOpen, setBulkOpen] = useSessionState("find:verify:bulkOpen", false);
+  const [text, setText] = useSessionState("find:verify:bulk", "");
+  const [results, setResults] = useSessionState<VerifyReport[]>("find:verify:results", []);
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   const [filter, setFilter] = useState("");
-  const emails = useMemo(() => [...new Set((text.match(EMAIL_RE) ?? []).map((e) => e.toLowerCase()))], [text]);
-  const shown = filter ? results.filter((r) => r.status === filter) : results;
-  const counts = results.reduce<Record<string, number>>((m, r) => ({ ...m, [r.status]: (m[r.status] ?? 0) + 1 }), {});
+  const line = useProgressLine(busy, ["Checking the format and domain…", "Asking the mail server…", "Checking public profiles…"]);
 
   const run = async () => {
-    if (!emails.length || emails.length > MAX_VERIFY) return;
-    setResults([]);
-    setFilter("");
-    setProgress({ done: 0, total: emails.length });
+    const email = (q.match(EMAIL_RE) ?? [q.trim()])[0];
+    setBusy(true); setError(""); setRes(null);
+    try {
+      const [r] = await verifyBatch([email], true);
+      if (r) setRes(r); else setError("Enter an email address");
+    } catch (e) { setError((e as Error).message || "Something went wrong"); } finally { setBusy(false); }
+  };
+
+  const emails = useMemo(() => [...new Set((text.match(EMAIL_RE) ?? []).map((e) => e.toLowerCase()))], [text]);
+  const runBulk = async () => {
+    setResults([]); setFilter(""); setProgress({ done: 0, total: emails.length });
     try {
       for (let i = 0; i < emails.length; i += 25) {
         const batch = await verifyBatch(emails.slice(i, i + 25));
         setResults((r) => [...r, ...batch]);
         setProgress({ done: Math.min(emails.length, i + 25), total: emails.length });
       }
-    } catch (err) {
-      toast.error((err as Error).message || "Something went wrong");
-    } finally {
-      setProgress(null);
-    }
+    } catch (e) { toast.error((e as Error).message); } finally { setProgress(null); }
   };
-
-  const csv = () => {
-    const rows = [["email", "result", "score", "reason", "suggestion", "provider"],
-      ...results.map((r) => [r.email, VERIFY_LABEL[r.status] ?? r.status, String(r.score), plainReason(r.reason), r.suggestion ?? "", r.provider ?? ""])];
-    const blob = new Blob(["﻿" + rows.map((r) => r.map((c) => `"${c.replace(/"/g, '""')}"`).join(",")).join("\r\n")], { type: "text/csv" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = "checked-emails.csv";
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-  };
-  const copyValid = () => {
-    const valid = results.filter((r) => r.status === "valid").map((r) => r.email);
-    if (!valid.length) return toast.error("No valid addresses to copy");
-    navigator.clipboard.writeText(valid.join("\n")).then(() => toast.success(`Copied ${fmtNum(valid.length)} valid address${valid.length === 1 ? "" : "es"}`), () => toast.error("Couldn't copy"));
-  };
+  const counts = results.reduce<Record<string, number>>((m, r) => ({ ...m, [r.status]: (m[r.status] ?? 0) + 1 }), {});
+  const shown = filter ? results.filter((r) => r.status === filter) : results;
 
   return (
     <div className="grid gap-4">
-      <Card className="p-4 grid gap-3">
-        <Field label="Emails to check" hint="Paste anything: one per line, comma-separated, or a whole block of text. Up to 1,000 at a time. Leads you already have get the result too.">
-          <Textarea rows={6} value={text} onChange={(e) => setText(e.target.value)} className="font-mono text-[12.5px]"
-            placeholder={"priya@acme.com\nrahul.mehta@delhivery.com, info@tvsmotor.com\nsomeone@gmial.com"} />
-        </Field>
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <span className={cx("text-[12.5px]", emails.length > MAX_VERIFY ? "text-bad" : "text-muted")}>
-            {emails.length > MAX_VERIFY ? `${fmtNum(emails.length)} addresses: check up to 1,000 at a time` : emails.length ? `${fmtNum(emails.length)} unique address${emails.length === 1 ? "" : "es"} found` : "No addresses yet"}
-          </span>
-          <Button variant="primary" onClick={() => void run()} disabled={!emails.length || Boolean(progress) || emails.length > MAX_VERIFY}>
-            {progress ? <><Spinner />Checking {fmtNum(progress.done)} of {fmtNum(progress.total)}…</> : <><MailCheck size={15} />Check {emails.length ? fmtNum(emails.length) : ""} email{emails.length === 1 ? "" : "s"}</>}
-          </Button>
-        </div>
-        {progress && <div className="h-1.5 rounded-full bg-panel-2 overflow-hidden"><div className="h-full bg-accent transition-[width] duration-300" style={{ width: `${(progress.done / progress.total) * 100}%` }} /></div>}
-        {footnote}
-      </Card>
+      <SearchBar button="Verify email" busy={busy} disabled={!q.trim()} onSubmit={run}>
+        <MailCheck size={18} className="hidden sm:block self-center ml-4 text-faint shrink-0" />
+        <input className={barInput} value={q} onChange={(e) => setQ(e.target.value)} placeholder="name@company.com" aria-label="Email address" inputMode="email" />
+      </SearchBar>
+      {error && <p className="text-[13px] text-bad text-center">{error}</p>}
+      {busy && <Working line={line} />}
+      {res && !busy && <VerifyCard r={res} onSave={() => save([{ email: res.email, status: res.status }])} onFix={(s) => { setQ(s); }} />}
 
-      {results.length > 0 && (
-        <Card className="overflow-hidden">
-          <div className="flex flex-wrap items-center gap-2 px-3 py-2.5 border-b border-line">
-            <Chip active={!filter} onClick={() => setFilter("")}>All {fmtNum(results.length)}</Chip>
-            {(["valid", "risky", "invalid", "unknown"] as const).map((s) => counts[s] ? <Chip key={s} active={filter === s} onClick={() => setFilter(s)}>{VERIFY_LABEL[s]} {fmtNum(counts[s])}</Chip> : null)}
-            <span className="ml-auto flex flex-wrap gap-2">
-              <Button size="sm" onClick={copyValid}><Copy size={14} />Copy valid</Button>
-              <Button size="sm" onClick={csv}><Download size={14} />Download CSV</Button>
-            </span>
+      <BulkToggle open={bulkOpen} onClick={() => setBulkOpen(!bulkOpen)} label="Verify a list" />
+      {bulkOpen && (
+        <Card className="p-4 grid gap-3 fade-in">
+          <Textarea rows={5} value={text} onChange={(e) => setText(e.target.value)} className="font-mono text-[12.5px]"
+            placeholder={"priya@acme.com\nrahul.mehta@delhivery.com, info@tvsmotor.com"} />
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <span className="text-[12.5px] text-muted">Paste anything: one per line, comma-separated, or a block of text. Up to 1,000.{emails.length ? ` ${fmtNum(emails.length)} found.` : ""}</span>
+            <Button variant="primary" onClick={runBulk} disabled={!emails.length || Boolean(progress) || emails.length > 1000}>
+              {progress ? <><Spinner />Checking {progress.done}/{progress.total}…</> : <><ShieldCheck size={15} />Verify {emails.length || ""}</>}
+            </Button>
           </div>
-          <div className="px-3 py-2.5 border-b border-line">
-            <SaveForm campaigns={campaigns} preset={preset} label="Add as leads" defaultList="checked"
-              rows={results.filter((r) => r.status !== "invalid").map((r) => ({ email: r.email, status: r.status }))} />
-          </div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-[13px]">
-              <thead className="bg-panel-2/50"><tr><Th>Email</Th><Th>Result</Th><Th>Why</Th><Th>Provider</Th></tr></thead>
-              <tbody>
-                {shown.map((r) => (
-                  <tr key={r.email} className="hover:bg-panel-2/60">
-                    <Td className="font-medium max-w-[260px] truncate">{r.email}</Td>
-                    <Td className="whitespace-nowrap">
-                      <StatusBadge status={r.status} kind="verify" />
-                      <span className="ml-1.5 text-[11.5px] text-faint tabular-nums">{r.score}</span>
-                    </Td>
-                    <Td className="text-muted min-w-[220px]">
-                      {plainReason(r.reason)}
-                      {r.suggestion && <button type="button" className="block text-accent text-[12px] hover:underline" onClick={() => setText((t) => t.replace(r.email, r.suggestion!))}>Did you mean {r.suggestion}? (fix in list)</button>}
-                      <span className="flex flex-wrap gap-1 mt-1">
-                        {r.checks.role && <Badge>Shared address (info@, sales@…)</Badge>}
-                        {r.source === "history" && <Badge tone="good">From your own data</Badge>}
-                        {r.checks.freeMail && <Badge>Personal email</Badge>}
-                        {r.checks.acceptAll && <Badge tone="warn">Accepts any address</Badge>}
-                        {r.source === "cache" && <Badge>Checked earlier</Badge>}
-                      </span>
-                    </Td>
-                    <Td className="text-muted text-[12.5px] max-w-[200px] truncate">{r.provider ?? "—"}</Td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </Card>
-      )}
-
-      {!results.length && !progress && (
-        <Card className="p-4 text-[13px] text-muted grid gap-1.5">
-          <div className="font-medium text-ink">What the results mean</div>
-          <div><Badge tone="good" dot>{VERIFY_LABEL.valid}</Badge> the mailbox exists. Safe to email.</div>
-          <div><Badge tone="warn" dot>{VERIFY_LABEL.risky}</Badge> the company accepts any address, a shared address (info@), or a likely typo. Send carefully.</div>
-          <div><Badge dot>{VERIFY_LABEL.unknown}</Badge> the domain accepts email but its server wouldn&apos;t confirm the mailbox (common with big providers). Fine to email; bounces are watched.</div>
-          <div><Badge tone="bad" dot>{VERIFY_LABEL.invalid}</Badge> doesn&apos;t exist, no mail server, or a throwaway address. Don&apos;t send: it would hurt your sender reputation.</div>
+          {progress && <div className="h-1.5 rounded-full bg-panel-2 overflow-hidden"><div className="h-full bg-accent transition-[width] duration-300" style={{ width: `${(progress.done / progress.total) * 100}%` }} /></div>}
+          {results.length > 0 && (
+            <>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <Chip active={!filter} onClick={() => setFilter("")}>All {results.length}</Chip>
+                {(["valid", "risky", "unknown", "invalid"] as const).map((s) => counts[s] ? <Chip key={s} active={filter === s} onClick={() => setFilter(s)}>{VERIFY_WORD[s]} {counts[s]}</Chip> : null)}
+                <span className="ml-auto flex gap-2">
+                  <Button size="sm" onClick={() => copy(results.filter((r) => r.status === "valid").map((r) => r.email).join("\n"), "Valid addresses copied")}><Copy size={14} />Copy valid</Button>
+                  <Button size="sm" onClick={() => downloadCsv("verified-emails.csv", [["email", "result", "score", "reason", "suggestion"], ...results.map((r) => [r.email, VERIFY_WORD[r.status], r.score, r.reason, r.suggestion ?? ""])])}><Download size={14} />CSV</Button>
+                  <Button size="sm" variant="primary" onClick={() => save(results.filter((r) => r.status !== "invalid").map((r) => ({ email: r.email, status: r.status })))}><UserPlus size={14} />Save usable as leads</Button>
+                </span>
+              </div>
+              <div className="relative overflow-x-auto rounded-lg border border-line">
+                <table className="w-full text-[13px]">
+                  <thead className="bg-panel-2/50"><tr><Th>Email</Th><Th>Result</Th><Th>Why</Th></tr></thead>
+                  <tbody>
+                    {shown.map((r) => (
+                      <tr key={r.email}>
+                        <Td className="font-medium max-w-[240px] truncate">{r.email}</Td>
+                        <Td className="whitespace-nowrap"><Badge tone={VERIFY_TONE[r.status]} dot>{VERIFY_WORD[r.status]}</Badge> <span className="text-[11.5px] text-faint tabular-nums">{r.score}</span></Td>
+                        <Td className="text-muted">{r.reason}{r.suggestion && <span className="block text-accent text-[12px]">Did you mean {r.suggestion}?</span>}</Td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
         </Card>
       )}
     </div>
   );
 }
 
-/* ───────────── Shared ───────────── */
-
-type SaveRow = { email: string; first_name?: string; last_name?: string; website?: string; status: string };
-
-/** "Add as leads" button that opens a small List + Campaign form in place. */
-function SaveForm({ rows, campaigns, preset, label, defaultList }: { rows: SaveRow[]; campaigns: CampaignOption[]; preset: string; label: string; defaultList: string }) {
-  const [open, setOpen] = useState(false);
-  const [list, setList] = useState(defaultList);
-  const [campaign, setCampaign] = useState(preset);
-  const [pending, run] = useAction();
-  const { confirm, element } = useConfirm();
-  if (!open) {
-    return <Button size="sm" variant="secondary" className="justify-self-start" disabled={!rows.length} onClick={() => setOpen(true)}><UserPlus size={14} />{label}</Button>;
-  }
-  const save = async () => {
-    const c = campaigns.find((x) => x.id === campaign);
-    const restart = c?.status === "completed" && await confirm({
-      title: `${c.name} had finished. Restart it for these leads?`,
-      body: "Restart it to start emailing them now. Cancel still adds them, and the campaign waits, paused, until you resume it.",
-      confirmLabel: "Restart it",
-    });
-    run(() => saveToLeads(rows, [list], campaign || null, { restart }), () => setOpen(false));
-  };
+function VerifyCard({ r, onSave, onFix }: { r: VerifyReport; onSave: () => void; onFix: (s: string) => void }) {
+  const tone = VERIFY_TONE[r.status];
+  const via = r.signals.gravatar ? "a public profile" : r.source === "smtp" ? "the company's mail server" : r.source === "history" ? "your own data" : r.source === "cache" ? "an earlier check" : "the domain's mail setup";
   return (
-    <div className="flex flex-wrap items-end gap-2 rounded-lg border border-line p-2.5 fade-in">
-      <Field label="List name" className="w-40"><Input value={list} onChange={(e) => setList(e.target.value)} className="h-8" /></Field>
-      <Field label="Add to campaign" className="w-56">
-        <Select value={campaign} onChange={(e) => setCampaign(e.target.value)} className="h-8">
-          <option value="">None</option>
-          {campaigns.map((c) => <option key={c.id} value={c.id}>{c.name}{c.status === "draft" ? " (not launched)" : c.status === "completed" ? " (finished)" : ""}</option>)}
-        </Select>
-      </Field>
-      <Button size="sm" variant="primary" disabled={pending || !rows.length} onClick={() => void save()}>{pending && <Spinner />}Add {fmtNum(rows.length)} lead{rows.length === 1 ? "" : "s"}</Button>
-      <Button size="sm" variant="ghost" onClick={() => setOpen(false)}>Cancel</Button>
-      {element}
-    </div>
+    <Card className="fade-in overflow-hidden">
+      <div className="flex flex-wrap items-center gap-4 p-5">
+        <Avatar text={r.initials} tone={tone} />
+        <div className="min-w-0 flex-1">
+          <div className="text-[17px] font-semibold break-all">{r.headline}</div>
+          <div className="text-[13px] text-muted mt-0.5">{r.summary}</div>
+          <div className="mt-1.5 flex flex-wrap items-center gap-2">
+            <Badge tone={tone} dot>{VERIFY_WORD[r.status]}</Badge>
+            <span className="text-[12px] text-faint tabular-nums">Score {r.score}/100</span>
+          </div>
+        </div>
+        {r.status !== "invalid" && <Button size="sm" onClick={onSave}><UserPlus size={14} />Save as lead</Button>}
+      </div>
+      {r.suggestion && (
+        <div className="px-5 pb-3 -mt-2 text-[13px]">
+          <button type="button" className="text-accent hover:underline" onClick={() => onFix(r.suggestion!)}>Did you mean {r.suggestion}? Check that instead</button>
+        </div>
+      )}
+      <div className="border-t border-line px-5 py-2.5 text-[12.5px] text-muted">{r.reason}. Checked via {via}.</div>
+      <div className="grid sm:grid-cols-2 gap-x-8 gap-y-5 border-t border-line bg-panel-2/40 px-5 py-5">
+        {r.subChecks.map((c) => (
+          <div key={c.key}>
+            <div className="flex items-center gap-2"><span className="font-medium text-[13.5px]">{c.label}</span><Badge tone={c.tone}>{c.value}</Badge></div>
+            <p className="mt-1.5 text-[13px] text-muted leading-snug">{c.detail}</p>
+          </div>
+        ))}
+      </div>
+    </Card>
   );
 }
 
-function Chip({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+function Chip({ active, onClick, children }: { active: boolean; onClick: () => void; children: ReactNode }) {
   return (
     <button type="button" onClick={onClick} className={cx("h-7 px-2.5 rounded-full text-[12.5px] border transition-colors tabular-nums",
       active ? "bg-ink text-bg border-ink" : "border-line text-muted hover:text-ink hover:bg-panel")}>{children}</button>

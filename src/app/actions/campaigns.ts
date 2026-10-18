@@ -11,6 +11,7 @@ import { draftStep, generateLine, RateLimitError } from "@/lib/groq";
 import { getLaunchChecklist } from "@/lib/launch-checklist";
 import { sendEmail } from "@/lib/mailer";
 import { prepareLead } from "@/lib/prepare";
+import { savePlaybook, type Playbook } from "@/lib/playbook";
 import { getProfile } from "@/lib/profile";
 import { leadDomain, profileText, type Research } from "@/lib/research";
 import { checkContent, type SpamReport } from "@/lib/spamcheck";
@@ -603,4 +604,44 @@ export async function reassignStuck(campaignId: string): Promise<ActionResult> {
   }
   refresh();
   return { ok: true, message: ids.length ? `Moved ${plural(ids.length, "lead")} to active accounts` : "No leads were waiting" };
+}
+
+/** Saves this campaign's AI playbook (optionally as the default for new campaigns) and queues unsent drafts for a rewrite. */
+export async function saveCampaignPlaybook(campaignId: string, pb: Playbook, alsoAsDefault = false): Promise<ActionResult> {
+  await requireAuth();
+  if (!UUID.test(campaignId)) return { ok: false, error: "Unknown campaign" };
+  if (!pb.pillars?.length) return { ok: false, error: "Pick at least one solution area" };
+  try {
+    await savePlaybook(campaignId, pb);
+    if (alsoAsDefault) await savePlaybook(null, pb);
+  } catch (err) {
+    return { ok: false, error: (err as Error).message };
+  }
+  const { data, error } = await db().from("campaign_leads").update({ prep_status: "pending", prep_error: null, prep_attempts: 0 })
+    .eq("campaign_id", campaignId).eq("current_step", 0).eq("status", "queued").neq("prep_status", "working").neq("prep_status", "pending")
+    .or("personalization->>edited.is.null,personalization->>edited.neq.true").select("id");
+  if (error) return { ok: false, error: error.message };
+  refresh();
+  const n = data?.length ?? 0;
+  return { ok: true, message: `Playbook saved${alsoAsDefault ? " (and set as default)" : ""}` + (n ? ` · ${plural(n, "lead")} will be rewritten` : "") };
+}
+
+/** Rewrites one lead's emails now, following a one-off note ("mention their new Pune plant"). */
+export async function rewriteLeadWithNote(campaignLeadId: string, note: string): Promise<ActionResult> {
+  await requireAuth();
+  const text = note.trim().slice(0, 600);
+  if (!text) return { ok: false, error: "Write a note for the AI first" };
+  if (!UUID.test(campaignLeadId)) return { ok: false, error: "Unknown lead" };
+  const supa = db();
+  const claim = must(await supa.from("campaign_leads").update({ prep_status: "working", prep_locked_until: new Date(Date.now() + 10 * 60_000).toISOString() })
+    .eq("id", campaignLeadId).eq("current_step", 0).neq("prep_status", "working").select("*")) as CampaignLead[];
+  if (!claim.length) return { ok: false, error: "This lead is being written right now, or its first email already went out" };
+  try {
+    await prepareLead(claim[0], { instruction: text });
+  } catch (err) {
+    await supa.from("campaign_leads").update({ prep_status: "pending", prep_locked_until: null, prep_error: (err as Error).message.slice(0, 300) }).eq("id", campaignLeadId);
+    return { ok: false, error: err instanceof RateLimitError ? `The AI is busy. Try again in ${err.retryAfterSec}s` : (err as Error).message };
+  }
+  refresh();
+  return { ok: true, message: "Rewritten with your note" };
 }

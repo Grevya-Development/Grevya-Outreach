@@ -46,6 +46,7 @@ export interface Analysis {
   customers: string;
   facts: string[];          // only things stated on their site
   likely_needs: string[];   // inferred, clearly marked as inference
+  pain_points?: string[];   // 3-5 specific pains, each with why (older cached analyses lack it)
   best_service: string;     // which of our services fits best
   fit_score: number;        // 0-10
   fit_reason: string;
@@ -307,6 +308,7 @@ Return JSON with exactly these keys:
  "customers": string, "facts": string[] (2-6 concrete facts stated on the site: products, plants, markets, scale, clients, launches, hiring, tools they use),
  "industry_context": string (1-2 sentences on how companies like this operate and where work is still manual — general knowledge, say so),
  "likely_needs": string[] (2-4 inferred operational needs, phrased as inferences),
+ "pain_points": string[] (3-5 specific pains this company most likely has. Each names the workflow and says why, e.g. "Dealer onboarding across 40+ dealers is likely paperwork-heavy (site lists dealers in 6 states)" or "...(typical for <industry>)". Every item is one distinct pain — no summary or filler lines),
  "use_cases": [ {"title": string (5-8 words), "pillar": one of ALLOWED PILLARS, "problem": string (the pain in their words — name the workflow, the people, the friction), "solution": string (what we'd build or change — concrete: inputs, what the system does, who approves), "outcome": string (what improves; qualitative or a range from the INDUSTRY brief, never a number invented about THIS company), "first_step": string (a 2-4 week pilot, audit or workshop), "grounded_in": "fact" | "industry"} ] (exactly 3, best first, use different pillars where sensible, at least one grounded in a FACT from their site),
  "best_service": string (which of OUR services fits best, our wording), "fit_score": integer 0-10, "fit_reason": string,
  "angle": string (one specific hook connecting a fact about them to use case 1),
@@ -332,7 +334,7 @@ export async function analyze(
     r.tech.length ? `Detected on their site: ${r.tech.join(", ")}` : "",
     `Website text:\n${r.content.slice(0, 4500) || "(empty)"}`,
   ].filter(Boolean).join("\n\n");
-  const raw = await chat({ system: ANALYZE_SYSTEM, user, temperature: 0.25, maxTokens: 1300, json: true, model, pool: "research" });
+  const raw = await chat({ system: ANALYZE_SYSTEM, user, temperature: 0.25, maxTokens: 1600, json: true, model, pool: "research" });
   const a = parseJson<Partial<Analysis>>(raw);
   const useCases: UseCase[] = (Array.isArray(a.use_cases) ? a.use_cases : []).slice(0, 3).map((u) => {
     const x = (u ?? {}) as Partial<UseCase>;
@@ -350,6 +352,7 @@ export async function analyze(
     customers: String(a.customers ?? ""),
     facts: Array.isArray(a.facts) ? a.facts.map(String).slice(0, 6) : [],
     likely_needs: Array.isArray(a.likely_needs) ? a.likely_needs.map(String).slice(0, 4) : [],
+    pain_points: Array.isArray(a.pain_points) ? a.pain_points.map(String).filter(Boolean).slice(0, 5) : [],
     best_service: String(a.best_service ?? ""),
     fit_score: Math.max(0, Math.min(10, Math.round(Number(a.fit_score) || 0))),
     fit_reason: String(a.fit_reason ?? ""),

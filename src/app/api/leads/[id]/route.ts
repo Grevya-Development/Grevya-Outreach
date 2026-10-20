@@ -1,4 +1,6 @@
 import { apiAuth } from "@/lib/api-auth";
+import { cachedIndustryBrief, type IndustryBrief } from "@/lib/industry";
+import { leadDomain } from "@/lib/research";
 import { db } from "@/lib/supabase";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -34,8 +36,18 @@ export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> 
     return { ...cl, campaign };
   });
 
+  // Company research for the lead's domain (from their website, else their email), plus the cached industry brief.
+  const domain = leadDomain(lead.data as { email: string; website?: string });
+  let research: Record<string, unknown> | null = null;
+  let industry: IndustryBrief | null = null;
+  if (domain) {
+    research = (await supa.from("company_research").select("domain, status, url, title, analysis, error, fetched_at, analyzed_at").eq("domain", domain).maybeSingle()).data;
+    const ind = (research?.analysis as { industry?: string } | null)?.industry;
+    if (ind) industry = await cachedIndustryBrief(ind);
+  }
+
   return Response.json(
-    { lead: lead.data, campaigns, steps, messages: messages.data ?? [], replies: replies.data ?? [] },
+    { lead: lead.data, campaigns, steps, messages: messages.data ?? [], replies: replies.data ?? [], domain, research, industry },
     { headers: { "Cache-Control": "no-store" } },
   );
 }

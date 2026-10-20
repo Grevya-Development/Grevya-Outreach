@@ -65,6 +65,13 @@ export async function industryBrief(industry: string): Promise<IndustryBrief | n
   return p;
 }
 
+/** The cached brief only (no AI call). Null if this industry hasn't been researched yet. */
+export async function cachedIndustryBrief(industry: string): Promise<IndustryBrief | null> {
+  if (!industry.trim()) return null;
+  const { data } = await db().from("app_state").select("value").eq("key", `industry:${slug(industry.trim())}`).maybeSingle();
+  return (data?.value as IndustryBrief | undefined) ?? null;
+}
+
 export function industryText(b: IndustryBrief | null, pillars: Pillar[]): string {
   if (!b) return "";
   return [

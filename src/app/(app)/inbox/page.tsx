@@ -5,8 +5,10 @@ import { Button, PageHeader, Skeleton } from "@/components/ui";
 import { filterOptions, getReplyRow, inboxCounts, listReplies, PAGE_SIZE, parseQuery } from "@/lib/inbox-data";
 import { db, must } from "@/lib/supabase";
 import type { Mailbox } from "@/lib/types";
+import { CheckRepliesButton } from "./check-replies";
 import { NewEmailButton } from "./compose";
 import { InboxView } from "./inbox-client";
+import { InboxTabs } from "./tabs";
 
 export const metadata = { title: "Inbox" };
 
@@ -14,11 +16,13 @@ export default function InboxPage({ searchParams }: PageProps<"/inbox">) {
   return (
     <>
       <PageHeader title="Inbox" description="Every reply from every email account. Answer it, set a reminder, or mark it done."
-        actions={
+        actions={<>
+          <Suspense fallback={null}><CheckRepliesButton /></Suspense>
           <Suspense fallback={<Button variant="primary" disabled><PenLine size={15} />New email</Button>}>
             <ComposeData searchParams={searchParams} />
           </Suspense>
-        } />
+        </>}
+        tabs={<InboxTabs active="replies" />} />
       <Suspense fallback={<InboxSkeleton />}>
         <InboxData searchParams={searchParams} />
       </Suspense>

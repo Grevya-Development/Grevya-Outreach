@@ -24,7 +24,7 @@ import { usesVariable } from "./template";
 import type { Campaign, CampaignLead, CampaignStep, Lead, Mailbox } from "./types";
 import { verifyEmail } from "./verify";
 
-const IMAP_SYNC_EVERY_MS = 5 * 60_000;
+const IMAP_SYNC_EVERY_MS = 2 * 60_000;
 const RECONTACT_DAYS = 7;      // don't start a new sequence with someone emailed this recently
 const SAME_COMPANY_HOURS = 24; // one first-touch per company domain per day
 const consecutiveFailures = new Map<string, number>();

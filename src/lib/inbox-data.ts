@@ -160,16 +160,21 @@ type ReceivedRow = { id: string; received_at: string; subject: string; body: str
 /** The whole conversation with this person: what we sent (campaign + manual) and what they replied. Null if the reply doesn't exist. */
 export async function loadThread(replyId: string): Promise<ThreadItem[] | null> {
   if (!UUID.test(replyId)) return null;
-  const supa = db();
-  const { data: r } = await supa.from("replies").select("lead_id, from_email").eq("id", replyId).maybeSingle();
+  const { data: r } = await db().from("replies").select("lead_id, from_email").eq("id", replyId).maybeSingle();
   if (!r) return null;
   const { lead_id, from_email } = r as { lead_id: string | null; from_email: string };
+  return threadFor({ leadId: lead_id, email: from_email });
+}
+
+/** Every email to and from one person (by lead, else by address), oldest first. */
+export async function threadFor({ leadId, email }: { leadId: string | null; email: string }): Promise<ThreadItem[]> {
+  const supa = db();
   const sentCols = "id, sent_at, subject, body, from_email, kind, step_number, status";
   const gotCols = "id, received_at, subject, body, snippet, from_name, from_email, kind";
   const [sent, received] = await Promise.all([
-    (lead_id ? supa.from("messages").select(sentCols).eq("lead_id", lead_id) : supa.from("messages").select(sentCols).eq("to_email", from_email))
+    (leadId ? supa.from("messages").select(sentCols).eq("lead_id", leadId) : supa.from("messages").select(sentCols).eq("to_email", email))
       .in("status", ["sent", "bounced"]).order("sent_at").limit(50).then(must),
-    (lead_id ? supa.from("replies").select(gotCols).eq("lead_id", lead_id) : supa.from("replies").select(gotCols).eq("from_email", from_email))
+    (leadId ? supa.from("replies").select(gotCols).eq("lead_id", leadId) : supa.from("replies").select(gotCols).eq("from_email", email))
       .order("received_at").limit(50).then(must),
   ]);
   const items: ThreadItem[] = [

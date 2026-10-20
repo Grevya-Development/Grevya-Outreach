@@ -4,6 +4,11 @@ import { refresh } from "next/cache";
 import { applyLeadFilter, parseLeadFilter, type LeadSelection } from "@/app/(app)/leads/tabs";
 import type { ActionResult } from "@/components/client";
 import { fmtNum } from "@/lib/format";
+import { RateLimitError } from "@/lib/groq";
+import { industryBrief } from "@/lib/industry";
+import { getPlaybook } from "@/lib/playbook";
+import { getProfile } from "@/lib/profile";
+import { leadDomain, researchDomain } from "@/lib/research";
 import { db, must } from "@/lib/supabase";
 import { isEmailSyntax } from "@/lib/verify";
 import { requireAuth } from "./auth";
@@ -320,4 +325,32 @@ export async function addLeadsManually(input: {
     ok: true, inserted: fresh.length, updated, invalid, suppressed: [...blocked].length, enrolled,
     message: parts.join(" · ") || "Nothing to add",
   };
+}
+
+/**
+ * Researches a lead's company from their email domain (or website): visits the site, then the AI
+ * works out what they do, likely pain points and 3 use cases. Cached per company; `force` re-reads
+ * the site. Also fills an empty company name / website on the lead.
+ */
+export async function researchLead(id: string, force = false): Promise<ActionResult> {
+  await requireAuth();
+  const supa = db();
+  const { data: lead } = await supa.from("leads").select("id, email, website, company").eq("id", id).maybeSingle();
+  if (!lead) return { ok: false, error: "Lead not found" };
+  const domain = leadDomain(lead);
+  if (!domain) return { ok: false, error: "This is a personal email address (Gmail, Yahoo…). Add their company website to research it" };
+  const profile = await getProfile();
+  if (!profile.services.trim()) return { ok: false, error: "Fill in your company profile first (Settings → Company profile), so the AI knows what you offer" };
+  try {
+    const r = await researchDomain(domain, profile, { force, playbook: await getPlaybook(null) });
+    if (r.status === "failed") return { ok: false, error: `Couldn't read ${domain}: ${r.error ?? "the site didn't respond"}` };
+    if (r.analysis?.industry) await industryBrief(r.analysis.industry); // cached per industry; shown alongside
+    const patch: Record<string, string> = {};
+    if (!lead.company?.trim() && r.analysis?.company_name) patch.company = r.analysis.company_name;
+    if (!lead.website?.trim()) patch.website = domain;
+    if (Object.keys(patch).length) await supa.from("leads").update(patch).eq("id", id);
+  } catch (err) {
+    return { ok: false, error: err instanceof RateLimitError ? `The AI is busy. Try again in ${err.retryAfterSec}s` : (err as Error).message };
+  }
+  return { ok: true, message: `Researched ${domain}` };
 }

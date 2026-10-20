@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import type { ActionResult } from "@/components/client";
 import { fmtDay } from "@/lib/format";
 import { blockReasonLabel, REPLY_LABELS } from "@/lib/labels";
+import { syncMailbox } from "@/lib/imap";
 import { appendToSent, sendEmail } from "@/lib/mailer";
 import { db, must } from "@/lib/supabase";
 import type { Mailbox, Reply, ReplyLabel } from "@/lib/types";
@@ -171,4 +172,19 @@ export async function undoBlock(replyId: string, previous: string | null): Promi
   const restore = previous && (KNOWN_LABELS.has(previous) || previous === "neutral") ? previous : null;
   must(await supa.from("replies").update({ sentiment: restore }).eq("id", replyId));
   return { ok: true, message: "Unblocked. They can be added to campaigns again." };
+}
+
+/** Checks every email account for new replies right now (the engine also does this every couple of minutes). */
+export async function checkRepliesNow(): Promise<ActionResult & { found?: number }> {
+  await requireAuth();
+  const boxes = must(await db().from("mailboxes").select("*").not("imap_host", "is", null).neq("status", "error")) as Mailbox[];
+  if (!boxes.length) return { ok: false, error: "No email account can receive mail yet. Add IMAP settings on the Email accounts page" };
+  const results = await Promise.allSettled(boxes.map((mb) => syncMailbox(mb)));
+  const found = results.reduce((n, r) => n + (r.status === "fulfilled" ? r.value : 0), 0);
+  const failed = results.map((r, i) => (r.status === "rejected" ? `${boxes[i].email}: ${(r.reason as Error).message}` : null)).filter(Boolean);
+  if (failed.length === boxes.length) return { ok: false, error: `Couldn't check for replies — ${failed[0]}` };
+  return {
+    ok: true, found,
+    message: (found ? `${found} new ${found === 1 ? "reply" : "replies"}` : "No new replies") + (failed.length ? ` · couldn't check ${failed.length} account${failed.length === 1 ? "" : "s"}` : ""),
+  };
 }

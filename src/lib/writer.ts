@@ -60,7 +60,7 @@ function brief(input: WriteInput): string {
     l.notes && `Notes about recipient: ${l.notes}`,
     l.custom && Object.keys(l.custom).length ? `Other data: ${Object.entries(l.custom).map(([k, v]) => `${k}=${v}`).join("; ")}` : "",
     a
-      ? `RESEARCH:\nWhat they do: ${a.what_they_do}\nIndustry: ${a.industry}\nBusiness model: ${a.business_model}\nCustomers: ${a.customers}\nFACTS (true, from their site): ${a.facts.join(" | ") || "none"}\nLikely needs (inference): ${a.likely_needs.join(" | ")}\nBest service for them: ${a.best_service}\nSuggested angle: ${a.angle}`
+      ? `RESEARCH:\nWhat they do: ${a.what_they_do}\nIndustry: ${a.industry}\nBusiness model: ${a.business_model}\nCustomers: ${a.customers}\nFACTS (true, from their site): ${a.facts.join(" | ") || "none"}\nLikely needs (inference): ${a.likely_needs.join(" | ")}${a.pain_points?.length ? `\nLikely pain points (inference): ${a.pain_points.join(" | ")}` : ""}\nBest service for them: ${a.best_service}\nSuggested angle: ${a.angle}`
       : "RESEARCH: none available — keep the opener about their role/industry and make no claims about the company.",
     input.tech.length ? `Detected on their website: ${input.tech.join(", ")}` : "",
     `PLAYBOOK:\n${playbookText(input.playbook ?? DEFAULT_PLAYBOOK)}`,
@@ -143,7 +143,7 @@ export async function writeSequence(input: WriteInput): Promise<WrittenEmail[]> 
     p.proof, p.services, p.one_liner, p.cta, p.ideal_customer, p.sender_title, p.name, input.extraInstructions, input.leadInstruction,
     playbookText(pb), industryText(input.industryBrief ?? null, pb.pillars), a?.industry_context,
     a?.use_cases?.map((u) => `${u.title} ${u.problem} ${u.solution} ${u.outcome} ${u.first_step}`).join(" "),
-    a ? [...a.facts, ...a.likely_needs, a.what_they_do, a.customers, a.company_name, a.industry, a.business_model, a.best_service, a.angle].join(" ") : "",
+    a ? [...a.facts, ...a.likely_needs, ...(a.pain_points ?? []), a.what_they_do, a.customers, a.company_name, a.industry, a.business_model, a.best_service, a.angle].join(" ") : "",
     input.tech.join(" "),
     input.lead.title, input.lead.company, input.lead.notes, Object.values(input.lead.custom ?? {}).join(" "),
     input.steps.map((s) => `${s.brief} ${s.delay_days}`).join(" "),

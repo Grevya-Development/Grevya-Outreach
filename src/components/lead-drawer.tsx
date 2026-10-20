@@ -8,7 +8,9 @@ import { addLeadsToCampaign, addLeadsToList, deleteLeads, removeLeadFromCampaign
 import { addSuppression } from "@/app/actions/misc";
 import { fmtDate, fmtDateTime } from "@/lib/format";
 import { campaignLeadStatus, CAMPAIGN_STATUS_LABEL, REPLY_KIND_LABEL, replyLabel, verifyLabel, verifyTone } from "@/lib/labels";
+import type { IndustryBrief } from "@/lib/industry";
 import type { Lead } from "@/lib/types";
+import { CompanyResearch, type ResearchRow } from "./company-research";
 import { Drawer, Menu, Spinner, useAction, useConfirm, type ActionResult } from "./client";
 import { Badge, Button, ButtonLink, Field, Input, Select, Skeleton, StatusBadge, Textarea, cx } from "./ui";
 
@@ -21,7 +23,10 @@ type Enrolment = {
 };
 type Sent = { id: string; sent_at: string; subject: string; step_number: number; status: string; kind: string | null; campaign_id: string | null };
 type Received = { id: string; received_at: string; subject: string; snippet: string; kind: string; sentiment: string | null; campaign_id: string | null };
-type DrawerData = { lead: Lead; campaigns: Enrolment[]; steps: Record<string, number>; messages: Sent[]; replies: Received[] };
+type DrawerData = {
+  lead: Lead; campaigns: Enrolment[]; steps: Record<string, number>; messages: Sent[]; replies: Received[];
+  domain: string | null; research: ResearchRow | null; industry: IndustryBrief | null;
+};
 
 type Load = { kind: "loading" } | { kind: "ok"; data: DrawerData } | { kind: "missing" } | { kind: "error"; message: string };
 
@@ -167,6 +172,8 @@ function LeadSheet({ leadId, onClose, campaigns, checking }: { leadId: string; o
             </div>
           </div>
 
+          <CompanyResearch leadId={lead.id} domain={load.data.domain} research={load.data.research} industry={load.data.industry} onDone={reload} />
+
           {/* Details */}
           <section className="grid gap-3">
             <h3 className="text-[13px] font-semibold">Details</h3>
@@ -269,7 +276,8 @@ function LeadSheet({ leadId, onClose, campaigns, checking }: { leadId: string; o
                     const what = m.kind === "manual" ? "Email you sent" : `Email ${m.step_number} sent`;
                     const camp = campaignName(m.campaign_id);
                     return (
-                      <li key={a.key} className="flex items-start gap-2.5 rounded-lg px-2 py-2">
+                      <li key={a.key}>
+                        <Link href={`/inbox/sent?id=${m.id}`} onClick={onClose} className="flex items-start gap-2.5 rounded-lg px-2 py-2 hover:bg-panel-2">
                         <Send size={14} className="text-faint mt-0.5 shrink-0" />
                         <div className="min-w-0 flex-1">
                           <div className="flex flex-wrap items-center gap-1.5 text-[12.5px]">
@@ -280,6 +288,7 @@ function LeadSheet({ leadId, onClose, campaigns, checking }: { leadId: string; o
                           <div className="text-[12.5px] text-muted truncate">{m.subject}</div>
                         </div>
                         <span className="text-[11.5px] text-faint whitespace-nowrap">{fmtDateTime(m.sent_at)}</span>
+                        </Link>
                       </li>
                     );
                   }
